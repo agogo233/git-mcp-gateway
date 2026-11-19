@@ -134,8 +134,10 @@ jobs:
         run: |
           set -e
           docker run --rm git-mcp-session:ci sh -c 'git --version && ssh -V && test -s /home/gitmcp/.ssh/known_hosts'
-          if docker run --rm git-mcp-session:ci sh -c 'find / -xdev \( -name "id_ed25519" -o -name "id_rsa" -o -name "*.age" -o -name "authorized_keys" \) 2>/dev/null | grep -q .'; then
-            echo "session image must not contain credential files"
+          MATCHES=$(docker run --rm git-mcp-session:ci sh -c 'find / -xdev -type f \( -name "id_ed25519" -o -name "id_rsa" -o -name "id_ecdsa" -o -name "*.age" -o -name "authorized_keys" \) 2>/dev/null' || true)
+          if [ -n "$MATCHES" ]; then
+            echo "session image must not contain credential files:"
+            echo "$MATCHES"
             exit 1
           fi
           echo "session image credential scan passed"
