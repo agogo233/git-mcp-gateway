@@ -10,7 +10,8 @@ RUN apk add --no-cache git openssh-client ca-certificates \
  && ssh-keyscan -t ed25519,ecdsa github.com ssh.github.com > /home/gitmcp/.ssh/known_hosts 2>/dev/null \
  && printf 'Host *\n  StrictHostKeyChecking yes\n  UserKnownHostsFile /home/gitmcp/.ssh/known_hosts\n' > /home/gitmcp/.ssh/config \
  && git config --system --add safe.directory '*' \
- && chmod 700 /home/gitmcp/.ssh
+ && chmod 700 /home/gitmcp/.ssh \
+ && chown -R 1000:1000 /home/gitmcp/.ssh
 
 # known_hosts are pinned at build time (image is immutable afterwards);
 # rebuild the image to pick up GitHub host key rotations.
