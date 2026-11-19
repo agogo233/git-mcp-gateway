@@ -18,6 +18,9 @@ func TestCheckRunArgs(t *testing.T) {
 	denied := [][]string{
 		{"git", "push", "--force", "origin", "main"},
 		{"git", "push", "origin", ":main"},
+		{"git", "push", "origin", "+main"},
+		{"git", "push", "--force-with-lease", "origin", "main"},
+		{"git", "push", "--mirror"},
 		{"git", "reset", "--hard", "HEAD~1"},
 		{"git", "commit", "--amend"},
 		{"git", "clean", "-fd"},

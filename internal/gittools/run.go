@@ -52,8 +52,15 @@ func CheckRunArgs(args []string) error {
 		if forbiddenArgs[a] {
 			return fmt.Errorf("argument %q is not allowed", a)
 		}
-		if sub == "push" && strings.HasPrefix(a, ":") {
-			return fmt.Errorf("delete-style refspec %q is not allowed", a)
+		if sub == "push" {
+			// force-push via flag or "+" refspec, and delete-style refspecs,
+			// are never allowed through the escape hatch.
+			if strings.HasPrefix(a, "+") || strings.HasPrefix(a, ":") {
+				return fmt.Errorf("force/delete refspec %q is not allowed", a)
+			}
+			if a == "--force-with-lease" || a == "--mirror" || a == "--prune" {
+				return fmt.Errorf("argument %q is not allowed", a)
+			}
 		}
 		if sub == "push" && strings.HasPrefix(a, "refs/heads/") && strings.Contains(a, ":") &&
 			strings.HasPrefix(strings.SplitN(a, ":", 2)[1], ":") {
