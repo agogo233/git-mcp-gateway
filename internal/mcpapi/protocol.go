@@ -165,7 +165,14 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, actor string) {
 	sid := r.Header.Get("Mcp-Session-Id")
 	s.sMu.Lock()
-	_, ok := s.sessions[sid]
+	sess, ok := s.sessions[sid]
+	if ok && sess.User != actor {
+		s.sMu.Unlock()
+		s.Audit.Log(audit.Event{Actor: actor, ActorType: "user", Event: "authz",
+			Session: sid, Result: "denied", Detail: "delete: session belongs to another user"})
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session belongs to another user"})
+		return
+	}
 	if ok {
 		delete(s.sessions, sid)
 	}
@@ -207,7 +214,14 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, actor string
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown session"})
 		return
 	}
-	_ = actor
+	// The MCP session is bound to the authenticated caller: a valid token
+	// alone must not grant access to somebody else's session id.
+	if sess.User != actor {
+		s.Audit.Log(audit.Event{Actor: actor, ActorType: "user", Event: "authz",
+			Session: sid, Result: "denied", Detail: "session belongs to another user"})
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session belongs to another user"})
+		return
+	}
 
 	switch req.Method {
 	case "ping":
@@ -233,9 +247,16 @@ func (s *Server) handleInitialize(w http.ResponseWriter, r *http.Request, actor 
 	sid := r.Header.Get("Mcp-Session-Id")
 	s.sMu.Lock()
 	existing, ok := s.sessions[sid]
-	if ok {
+	switch {
+	case ok && existing.User != actor:
+		s.sMu.Unlock()
+		s.Audit.Log(audit.Event{Actor: actor, ActorType: "user", Event: "authz",
+			Session: sid, Result: "denied", Detail: "initialize: session belongs to another user"})
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session belongs to another user"})
+		return
+	case ok:
 		existing.LastSeen = time.Now()
-	} else {
+	default:
 		sid = uuid.NewString()
 		s.sessions[sid] = &mcpSession{ID: sid, User: actor, Created: time.Now(), LastSeen: time.Now()}
 	}
@@ -330,6 +351,3 @@ func mustJSON(v any) json.RawMessage {
 	}
 	return data
 }
-
-var _ = creds.SocketName
-var _ = config.ActionPush

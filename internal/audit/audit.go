@@ -4,6 +4,7 @@ package audit
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,9 +30,15 @@ type Logger struct {
 	mu     sync.Mutex
 	f      *os.File
 	path   string
+	size   int64
+	rotate int64
 	recent []Event
 	limit  int
 }
+
+// auditRotateBytes bounds the live audit log; on overflow the file is
+// renamed to <path>.1 and a fresh one is opened.
+const auditRotateBytes = 16 << 20
 
 // Open creates the audit log file (and its directory) if needed.
 func Open(path string) (*Logger, error) {
@@ -42,7 +49,8 @@ func Open(path string) (*Logger, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Logger{f: f, path: path, limit: 500}, nil
+	size, _ := f.Seek(0, io.SeekEnd)
+	return &Logger{f: f, path: path, size: size, rotate: auditRotateBytes, limit: 500}, nil
 }
 
 // Log records one event. It never panics on write errors; the file write is
@@ -60,9 +68,29 @@ func (l *Logger) Log(e Event) {
 	if l.f != nil {
 		data, err := json.Marshal(e)
 		if err == nil {
-			_, _ = l.f.Write(append(data, '\n'))
+			n, _ := l.f.Write(append(data, '\n'))
+			l.size += int64(n)
+			if l.size > l.rotate {
+				l.rotateLocked()
+			}
 		}
 	}
+}
+
+// rotateLocked moves the current log aside and starts a fresh one.
+func (l *Logger) rotateLocked() {
+	if l.f != nil {
+		_ = l.f.Close()
+	}
+	_ = os.Rename(l.path, l.path+".1")
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		l.f = nil
+		l.size = 0
+		return
+	}
+	l.f = f
+	l.size = 0
 }
 
 // Recent returns up to n most recent events, newest first.

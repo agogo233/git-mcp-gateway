@@ -20,6 +20,9 @@ func TestRemoteMatches(t *testing.T) {
 		{"ssh://git@github.com/org/proj1.git", "github.com", "org/proj1", true},
 		{"git@github.com:org/other.git", "github.com", "org/proj1", false},
 		{"git@gitlab.com:org/proj1.git", "github.com", "org/proj1", false},
+		{"git@evil-github.com:org/proj1.git", "github.com", "org/proj1", false},
+		{"https://github.com.evil.com/org/proj1.git", "github.com", "org/proj1", false},
+		{"git@github.com:org/proj1", "github.com", "org/proj1", true},
 	}
 	for _, c := range cases {
 		if got := remoteMatches(c.url, c.host, c.repo); got != c.want {

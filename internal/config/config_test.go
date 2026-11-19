@@ -110,3 +110,70 @@ repos:
 		t.Fatal("expected validation error for dir with slash")
 	}
 }
+
+func TestLoadRejectsDotDotDir(t *testing.T) {
+	for _, d := range []string{"..", ".", ".git"} {
+		dir, clean := baseConfig(validUsers, validGrants, "workspace_root: /srv/workspaces\nrepos:\n  org/proj1:\n    github: org/proj1\n    dir: "+d+"\n")
+		if _, err := Load(dir); err == nil {
+			t.Fatalf("expected validation error for dir %q", d)
+		}
+		clean()
+	}
+}
+
+func TestLoadRejectsBadRepoID(t *testing.T) {
+	for _, id := range []string{"org/../x", "org//x", "../org", "org/proj1 "} {
+		dir, clean := baseConfig(validUsers, validGrants, "workspace_root: /srv/workspaces\nrepos:\n  \""+id+"\":\n    github: org/proj1\n")
+		if _, err := Load(dir); err == nil {
+			t.Fatalf("expected validation error for repo id %q", id)
+		}
+		clean()
+	}
+}
+
+func TestLoadRejectsBadCredentialName(t *testing.T) {
+	dir, clean := baseConfig(validUsers, `credentials:
+  "a/b":
+    repo: org/proj1
+    readonly: false
+    key_file: /keys/k.age
+grants:
+  - user: alice
+    repo: org/proj1
+    actions: [read]
+    credential: a/b
+`, validRepos)
+	defer clean()
+	if _, err := Load(dir); err == nil {
+		t.Fatal("expected validation error for credential name with slash")
+	}
+}
+
+func TestUpdateDeepCopyIsolation(t *testing.T) {
+	dir, clean := baseConfig(validUsers, validGrants, validRepos)
+	defer clean()
+	store, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// mutate on a copy must not leak into what readers see
+	if err := store.Update(func(c *Config) error {
+		c.Users["ghost"] = User{TokenHash: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", Name: "G", Email: "g@c"}
+		return nil
+	}); err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	if _, ok := store.Get().Users["ghost"]; !ok {
+		t.Fatal("expected update to be visible after successful reload")
+	}
+	// a failing mutation must not corrupt the live config
+	if err := store.Update(func(c *Config) error {
+		c.Grants = nil
+		return nil
+	}); err == nil {
+		t.Fatal("expected validation failure when grants become empty")
+	}
+	if len(store.Get().Grants) == 0 {
+		t.Fatal("live config must keep the previous grants after a rejected change")
+	}
+}

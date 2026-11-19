@@ -11,6 +11,14 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 )
 
+// NamedKey pairs a parsed private key with the name of the credential it was
+// loaded from, so a session agent never re-adds (or re-decrypts) the same
+// credential twice.
+type NamedKey struct {
+	Name string
+	Key  any
+}
+
 // SessionAgent is a per-session in-memory ssh-agent listening on a UNIX
 // socket. The socket is bind-mounted into the session container; the private
 // keys stay inside the gateway process for the whole agent lifetime.
@@ -22,6 +30,7 @@ type SessionAgent struct {
 	ln     net.Listener
 	done   chan struct{}
 	closed sync.Once
+	keys   map[string]bool // credential names already added
 }
 
 // SocketName is the container-side path the socket is mounted at.
@@ -54,15 +63,26 @@ func NewAgentPool(dir string) (*AgentPool, error) {
 }
 
 // StartSession creates an agent holding the given private keys for one
-// session. Keys are expected to be fully parsed (crypto.PrivateKey values);
-// plaintext key material must have been zeroed by the caller.
-func (p *AgentPool) StartSession(sessionID string, privateKeys []any) (*SessionAgent, error) {
-	if len(privateKeys) == 0 {
+// session, or returns the live agent if the session already exists. Keys are
+// expected to be fully parsed (crypto.PrivateKey values); plaintext key
+// material must have been zeroed by the caller. Keys whose credential name is
+// already loaded are skipped.
+func (p *AgentPool) StartSession(sessionID string, keys []NamedKey) (*SessionAgent, error) {
+	if len(keys) == 0 {
 		return nil, fmt.Errorf("no keys for session %s", sessionID)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if existing, ok := p.sessions[sessionID]; ok {
+		for _, k := range keys {
+			if existing.keys[k.Name] {
+				continue
+			}
+			if err := existing.agent.Add(agent.AddedKey{PrivateKey: k.Key, Comment: "git-mcp:" + sessionID}); err != nil {
+				return nil, fmt.Errorf("add key: %w", err)
+			}
+			existing.keys[k.Name] = true
+		}
 		return existing, nil
 	}
 	sock := filepath.Join(p.dir, sessionID+".sock")
@@ -81,12 +101,14 @@ func (p *AgentPool) StartSession(sessionID string, privateKeys []any) (*SessionA
 		agent:     agent.NewKeyring(),
 		ln:        ln,
 		done:      make(chan struct{}),
+		keys:      map[string]bool{},
 	}
-	for _, k := range privateKeys {
-		if err := sa.agent.Add(agent.AddedKey{PrivateKey: k, Comment: "git-mcp:" + sessionID}); err != nil {
+	for _, k := range keys {
+		if err := sa.agent.Add(agent.AddedKey{PrivateKey: k.Key, Comment: "git-mcp:" + sessionID}); err != nil {
 			ln.Close()
 			return nil, fmt.Errorf("add key: %w", err)
 		}
+		sa.keys[k.Name] = true
 	}
 	go func() {
 		for {
@@ -105,10 +127,23 @@ func (p *AgentPool) StartSession(sessionID string, privateKeys []any) (*SessionA
 	return sa, nil
 }
 
-// AddKey appends a key to a live session agent (e.g. a submodule repository
-// key that became necessary mid-session).
-func (sa *SessionAgent) AddKey(k any) error {
-	return sa.agent.Add(agent.AddedKey{PrivateKey: k, Comment: "git-mcp"})
+// MissingKeys returns the credential names not yet loaded into the session
+// agent, so callers only decrypt what is actually needed. When the session
+// agent does not exist yet, every requested name is considered missing.
+func (p *AgentPool) MissingKeys(sessionID string, names []string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sa, ok := p.sessions[sessionID]
+	if !ok {
+		return names
+	}
+	var out []string
+	for _, n := range names {
+		if !sa.keys[n] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // CloseSession stops the agent, removes its socket and forgets the session.

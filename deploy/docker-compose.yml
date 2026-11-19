@@ -17,9 +17,22 @@ services:
     container_name: git-mcp-gateway
     restart: unless-stopped
     ports:
-      - "${GATEWAY_ADDR:-0.0.0.0}:8443:8443"
+      - "${GATEWAY_ADDR:-127.0.0.1}:8443:8443"
     environment:
       - GIT_MCP_MASTER_KEY=${GIT_MCP_MASTER_KEY}
+    security_opt:
+      - no-new-privileges
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8443/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ../config:/etc/git-mcp-gateway:ro
       - /var/lib/git-mcp/keys:/keys:ro

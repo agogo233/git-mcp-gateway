@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/crypto/ssh"
 
@@ -109,7 +110,7 @@ func runKeytool(args []string) {
 				fatal("write pub: %v", err)
 			}
 		}
-		fmt.Println(stringsTrimRight(string(ssh.MarshalAuthorizedKey(sshPub))))
+		fmt.Println(strings.TrimRight(string(ssh.MarshalAuthorizedKey(sshPub)), " \r\n"))
 		fmt.Printf("encrypted private key written to %s\n", *out)
 	default:
 		keytoolUsage()
@@ -122,11 +123,4 @@ func keytoolUsage() {
   git-mcp-gateway keytool encrypt -i <pem-file> -o <encrypted-out>
   git-mcp-gateway keytool gen-deploy-key -name <comment> -pub <public-out> -o <encrypted-out>`)
 	os.Exit(2)
-}
-
-func stringsTrimRight(s string) string {
-	for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == '\r' || s[len(s)-1] == ' ') {
-		s = s[:len(s)-1]
-	}
-	return s
 }

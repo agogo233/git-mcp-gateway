@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
@@ -152,6 +151,10 @@ func (m *Manager) Exec(ctx context.Context, containerID string, cmd []string, ti
 	raw, _ := io.ReadAll(io.LimitReader(attach.Reader, int64(maxOut)+1))
 	if len(raw) > maxOut {
 		raw = raw[:maxOut]
+		// Drain the remainder before closing, otherwise the process on the
+		// other end dies on EPIPE and git reports a spurious failure even
+		// though the command itself succeeded. Bounded by the exec timeout.
+		_, _ = io.Copy(io.Discard, attach.Reader)
 	}
 	inspect, err := m.cli.ContainerExecInspect(ctx, exec.ID)
 	if err != nil {
@@ -200,7 +203,16 @@ func (m *Manager) Get(sessionID, repoID string) (Active, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.live[key(sessionID, repoID)]
-	return *a, ok
+	if !ok {
+		return Active{}, false
+	}
+	return *a, true
+}
+
+// Ping verifies the Docker daemon is reachable (startup fail-fast).
+func (m *Manager) Ping(ctx context.Context) error {
+	_, err := m.cli.Ping(ctx)
+	return err
 }
 
 // KillOrphans terminates managed containers left behind by a previous
@@ -237,5 +249,3 @@ func int64Ptr(v int64) *int64 { return &v }
 
 // Close closes the docker client.
 func (m *Manager) Close() error { return m.cli.Close() }
-
-var _ = types.IDResponse{} // keep import stable across SDK versions

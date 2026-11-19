@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/local/git-mcp-gateway/internal/gittools"
 )
 
 // submodule is one entry of a .gitmodules file.
@@ -101,20 +103,14 @@ func (s *Server) resolveSubmodules(user, repoPath string) ([]string, error) {
 }
 
 // githubRepoFromURL extracts "org/name" from an SSH or HTTPS GitHub URL.
+// The URL authority is compared exactly, so look-alike hosts
+// ("evil-github.com") are rejected.
 func githubRepoFromURL(url, host string) (string, bool) {
-	url = strings.TrimSuffix(strings.TrimSpace(url), ".git")
-	lower := strings.ToLower(url)
-	h := strings.ToLower(host)
-	var rest string
-	if i := strings.Index(lower, h+":"); i >= 0 { // ssh: git@github.com:org/name
-		rest = url[i+len(h)+1:]
-	} else if i := strings.Index(lower, h+"/"); i >= 0 { // https://github.com/org/name
-		rest = url[i+len(h)+1:]
-	} else {
+	uhost, path, ok := gittools.ParseGitURL(url)
+	if !ok || !strings.EqualFold(uhost, host) {
 		return "", false
 	}
-	rest = strings.Trim(rest, "/")
-	parts := strings.Split(rest, "/")
+	parts := strings.Split(path, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return "", false
 	}

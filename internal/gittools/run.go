@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/local/git-mcp-gateway/internal/config"
 )
 
 // allowlisted git subcommands for run_git. Everything else is rejected.
@@ -28,9 +30,17 @@ var forbiddenArgs = map[string]bool{
 	"-c": true, "--config": true,
 }
 
+// remoteWriteSubcommands mutate the workspace's remote configuration and are
+// never allowed through run_git (a prompt-injected agent must not be able to
+// point origin at an attacker-controlled server).
+var remoteWriteSubcommands = map[string]bool{
+	"set-url": true, "add": true, "remove": true, "rm": true, "rename": true,
+	"prune": true, "set-head": true, "set-branches": true,
+}
+
 // CheckRunArgs validates an agent-supplied git invocation. Only known
 // subcommands are allowed, dangerous flags are rejected everywhere, and
-// delete-style refspecs (push origin :branch) are refused.
+// force/delete-style refspecs are refused.
 func CheckRunArgs(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("args must not be empty")
@@ -52,22 +62,50 @@ func CheckRunArgs(args []string) error {
 		if forbiddenArgs[a] {
 			return fmt.Errorf("argument %q is not allowed", a)
 		}
-		if sub == "push" {
+		switch sub {
+		case "push":
 			// force-push via flag or "+" refspec, and delete-style refspecs,
-			// are never allowed through the escape hatch.
+			// are never allowed through the escape hatch. --force-with-lease
+			// is matched by prefix so "ref:expect" variants cannot slip by.
 			if strings.HasPrefix(a, "+") || strings.HasPrefix(a, ":") {
 				return fmt.Errorf("force/delete refspec %q is not allowed", a)
 			}
-			if a == "--force-with-lease" || a == "--mirror" || a == "--prune" {
+			if strings.HasPrefix(a, "--force-with-lease") || a == "--mirror" || a == "--prune" {
 				return fmt.Errorf("argument %q is not allowed", a)
 			}
-		}
-		if sub == "push" && strings.HasPrefix(a, "refs/heads/") && strings.Contains(a, ":") &&
-			strings.HasPrefix(strings.SplitN(a, ":", 2)[1], ":") {
-			return fmt.Errorf("delete-style refspec %q is not allowed", a)
+		case "fetch":
+			// force-fetching ("+" refspec) rewrites local remote-tracking
+			// refs; the plain fetch tools already cover the safe cases.
+			if strings.HasPrefix(a, "+") {
+				return fmt.Errorf("force refspec %q is not allowed", a)
+			}
+		case "remote":
+			// keep git remote read-only: the first non-flag argument selects
+			// the remote subcommand.
+			if !strings.HasPrefix(a, "-") && remoteWriteSubcommands[a] {
+				return fmt.Errorf("git remote %s is not allowed", a)
+			}
 		}
 	}
 	return nil
+}
+
+// RequiredAction maps an allowlisted git invocation to the grant action it
+// requires: write-style subcommands need push, network/workspace-mutating
+// ones need clone, everything else is read. Used to re-check run_git against
+// the caller's grant, since the tool itself is registered as read.
+func RequiredAction(args []string) string {
+	if len(args) < 2 {
+		return config.ActionRead
+	}
+	switch args[1] {
+	case "add", "commit", "push", "merge", "rebase", "cherry-pick", "revert", "stash":
+		return config.ActionPush
+	case "pull", "fetch", "checkout", "switch", "restore":
+		return config.ActionClone
+	default:
+		return config.ActionRead
+	}
 }
 
 // ValidateRefName guards branch/tag names supplied by agents.

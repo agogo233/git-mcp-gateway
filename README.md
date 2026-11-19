@@ -28,13 +28,14 @@
 ## 核心安全模型
 
 1. **密钥零暴露**：deploy key 私钥以 NaCl secretbox 加密落盘（主密钥在 `GIT_MCP_MASTER_KEY` 环境变量），运行时解密进网关进程内存中的 `ssh-agent`，通过 UNIX socket 注入会话容器。容器与 LLM 上下文中永远没有私钥。
-2. **授权表**：`user × repo → actions(read/clone/push) → credential`，配置热更新；越权调用直接拒绝并审计。
-3. **最小暴露容器**：session 容器只挂载目标仓库子目录与 agent socket，无 docker.sock、无密钥文件、cap drop ALL、no-new-privileges、资源限额。
-4. **高危拦截**：`push --force`、`reset --hard`、`commit --amend`、删除型 refspec、`git config`、`submodule` 任意命令等一律拒绝；submodule 走受控工具并校验 `.gitmodules`（仅 GitHub URL、仅单层、逐仓授权）。
-5. **输出脱敏**：所有返回给 Agent 的内容经过 token/私钥/JWT/URL 凭据正则清洗。
-6. **全量审计**：认证、授权拒绝、会话生命周期、每次 git 执行、管理台操作均落 JSONL 审计日志。
-7. **内存加固**：私钥明文即用即弃、用后置零；部署要求禁用 swap、关闭 core dump。
-8. **持久工作区 + 仓库互斥锁**：仓库目录长期保留，同一仓库同一时刻只允许一个会话容器操作。
+2. **授权表**：`user × repo → actions(read/clone/push) → credential`，配置热更新；越权调用直接拒绝并审计。`run_git` 按子命令二次鉴权（`add/commit/push/merge/rebase/...` 需 push、`pull/fetch/checkout/...` 需 clone），只读授权永远无法借道 `run_git` 执行写操作。
+3. **会话绑定身份**：MCP 会话（`Mcp-Session-Id`）与认证用户绑定，持有他人 sid 的合法 token 也会被 403 拒绝并审计。
+4. **最小暴露容器**：session 容器只挂载目标仓库子目录与 agent socket，无 docker.sock、无密钥文件、cap drop ALL、no-new-privileges、资源限额。
+5. **高危拦截**：`push --force`、`push --force-with-lease`（含 `=ref:expect` 变体）、`reset --hard`、`commit --amend`、删除型 refspec、`git config`、`git remote set-url`、submodule 任意命令等一律拒绝；submodule 走受控工具并校验 `.gitmodules`（仅 GitHub URL、仅单层、逐仓授权）。
+6. **输出脱敏**：所有返回给 Agent 的内容经过 token/私钥/JWT/URL 凭据正则清洗。
+7. **全量审计**：认证、授权拒绝、会话生命周期、每次 git 执行（含完整命令行）、管理台操作均落 JSONL 审计日志。
+8. **内存加固**：私钥明文即用即弃、用后置零；部署要求禁用 swap、关闭 core dump。
+9. **持久工作区 + 仓库互斥锁**：仓库目录长期保留，同一仓库同一时刻只允许一个会话容器操作（工具编排全程持锁，管理台可强制解锁）。
 
 ## 目录结构
 
@@ -114,11 +115,13 @@ Agent 可用工具：`git_status / git_diff / git_log / git_branch_list / git_cr
 ## 验收清单
 
 - [ ] alice 推送自己仓库 → 成功；bob 推送（只读凭据）→ 拒绝且有审计
-- [ ] 用 bob 的 token 调 alice 的仓库 → `permission denied`
-- [ ] `run_git` 传 `push --force` / `reset --hard` → 被拒
+- [ ] bob（read/clone 授权）用 `run_git` 传 `["git","push","origin","main"]` → `permission denied: push not granted`
+- [ ] 用 bob 的 token 调 alice 的仓库 → `permission denied`；用 bob 的 token 复用 alice 的 `Mcp-Session-Id` → 403
+- [ ] `run_git` 传 `push --force` / `push --force-with-lease=main:abc` / `reset --hard` / `remote set-url` → 被拒
 - [ ] session 容器内 `find / -name "*.age" -o -name "id_*"` → 无私钥文件
-- [ ] 审计日志可见每次操作归因到 用户×仓库×凭据
+- [ ] 审计日志可见每次操作归因到 用户×仓库×凭据×完整命令
 - [ ] 同仓库并发第二个会话 → 被互斥锁拒绝
+- [ ] gateway 端口默认只绑 `127.0.0.1`（容器间走 opencode-net 直连）
 
 ## 回滚
 
@@ -128,5 +131,5 @@ Agent 可用工具：`git_status / git_diff / git_log / git_branch_list / git_cr
 
 - gateway 容器持有 docker.sock（等同宿主机 root 权限），镜像最小化 + 只读配置缓解
 - deploy key 不过期：靠会话 TTL、授权粒度与审计兜底；后续可切 Vault SSH CA 短时证书或 GitHub App 短时 token
-- 内网明文传输：gateway 端口不对外网映射；上 TLS 只需在反代层加
+- 内网明文传输：gateway 端口默认只绑宿主机 `127.0.0.1`，不对外网暴露；容器间走 opencode-net 直连，上 TLS 只需在反代层加
 - Go GC 环境下内存加固非绝对（已做：即用即弃、置零、禁 swap、关 core dump；页锁为后续增强）

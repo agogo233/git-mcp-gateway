@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/local/git-mcp-gateway/internal/config"
+	"github.com/local/git-mcp-gateway/internal/gittools"
 )
 
 // Sentinel errors surfaced to agents with actionable messages.
@@ -228,17 +229,14 @@ func readOriginURL(gitDir string) (string, bool) {
 }
 
 // remoteMatches checks that a git remote URL points at the expected GitHub
-// repository over SSH or HTTPS.
+// repository over SSH or HTTPS. The URL authority is compared exactly (no
+// substring matching), so look-alike hosts cannot pass the check.
 func remoteMatches(url, host, repo string) bool {
-	url = strings.TrimSuffix(strings.TrimSpace(url), ".git")
-	host = strings.ToLower(host)
-	lower := strings.ToLower(url)
-	if !strings.Contains(lower, host) {
+	uhost, upath, ok := gittools.ParseGitURL(url)
+	if !ok {
 		return false
 	}
-	// accept host:org/name (SSH) and host/org/name (HTTPS) suffixes
-	return strings.HasSuffix(lower, ":"+strings.ToLower(repo)) ||
-		strings.HasSuffix(lower, "/"+strings.ToLower(repo))
+	return strings.EqualFold(uhost, host) && strings.EqualFold(upath, repo)
 }
 
 func sanitizeURL(url string) string {

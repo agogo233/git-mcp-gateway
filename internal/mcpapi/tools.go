@@ -4,10 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-
-	"golang.org/x/crypto/ssh"
 
 	"github.com/local/git-mcp-gateway/internal/audit"
 	"github.com/local/git-mcp-gateway/internal/config"
@@ -20,29 +17,43 @@ import (
 func sanitizeText(s string) string { return sanitize.Clean(s) }
 
 // toolDef describes one MCP tool. Run performs the full orchestration.
+// Check, when set, runs extra authorization/validation with the caller's
+// grant before any workspace or container work happens.
 type toolDef struct {
 	Name        string
 	Description string
 	Schema      map[string]any
+	Check       func(c *callCtx, a map[string]any, grant config.Grant) error
 	Run         func(ctx context.Context, c *callCtx, args map[string]any) (string, error)
 }
 
 // repoTool wraps a repository-scoped git tool: it extracts the repo argument
-// and delegates to the orchestration core with the required action.
+// and delegates to the orchestration core with the required action. An
+// optional check runs with the caller's grant before any workspace work.
 func repoTool(name, desc, action string, schema map[string]any,
-	build func(c *callCtx, a map[string]any, cloned bool) ([]string, error)) toolDef {
-	return toolDef{
-		Name: name, Description: desc, Schema: schema,
-		Run: func(ctx context.Context, c *callCtx, a map[string]any) (string, error) {
-			repoID, err := strArg(a, "repo")
-			if err != nil {
-				return "", err
-			}
-			return c.runGit(ctx, repoID, action, func(cloned bool) ([]string, error) {
-				return build(c, a, cloned)
-			})
-		},
+	build func(c *callCtx, a map[string]any, cloned bool) ([]string, error),
+	checks ...func(c *callCtx, a map[string]any, grant config.Grant) error) toolDef {
+	var check func(c *callCtx, a map[string]any, grant config.Grant) error
+	if len(checks) > 0 {
+		check = checks[0]
 	}
+	d := toolDef{Name: name, Description: desc, Schema: schema, Check: check}
+	d.Run = func(ctx context.Context, c *callCtx, a map[string]any) (string, error) {
+		repoID, err := strArg(a, "repo")
+		if err != nil {
+			return "", err
+		}
+		check := func(grant config.Grant) error {
+			if d.Check == nil {
+				return nil
+			}
+			return d.Check(c, a, grant)
+		}
+		return c.runGit(ctx, repoID, action, check, func(cloned bool) ([]string, error) {
+			return build(c, a, cloned)
+		})
+	}
+	return d
 }
 
 func strArg(args map[string]any, key string) (string, error) {
@@ -104,9 +115,11 @@ func repoProp() map[string]any {
 	return strProp("repository identifier, e.g. org/name (must be registered and granted)")
 }
 
-// runGit is the orchestration core: authorize → lock → verify workspace →
-// aggregate agent keys → ensure container → (clone if needed) → exec.
-func (c *callCtx) runGit(ctx context.Context, repoID, action string, build func(cloned bool) ([]string, error)) (string, error) {
+// runGit is the orchestration core: authorize → extra tool check → lock →
+// verify workspace → aggregate agent keys → ensure container → (clone if
+// needed) → exec.
+func (c *callCtx) runGit(ctx context.Context, repoID, action string,
+	check func(grant config.Grant) error, build func(cloned bool) ([]string, error)) (string, error) {
 	s := c.s
 	cfg := s.Store.Get()
 	if _, ok := cfg.Repos[repoID]; !ok {
@@ -123,6 +136,22 @@ func (c *callCtx) runGit(ctx context.Context, repoID, action string, build func(
 			Repo: repoID, Tool: action, Result: "denied", Detail: "action not granted"})
 		return "", fmt.Errorf("permission denied: %s not granted on %s", action, repoID)
 	}
+	if check != nil {
+		if err := check(grant); err != nil {
+			s.Audit.Log(audit.Event{Actor: c.user(), ActorType: "user", Event: "authz",
+				Repo: repoID, Tool: action, Result: "denied", Detail: err.Error()})
+			return "", err
+		}
+	}
+
+	// One session container at a time per repository: the persistent
+	// workspace (git index included) must not be touched concurrently.
+	if err := s.Repos.TryLock(repoID, c.sid(), c.user()); err != nil {
+		s.Audit.Log(audit.Event{Actor: c.user(), ActorType: "user", Event: "authz",
+			Repo: repoID, Session: c.sid(), Result: "denied", Detail: err.Error()})
+		return "", err
+	}
+	defer s.Repos.Release(repoID, c.sid())
 
 	_, path, err := s.Repos.Resolve(repoID)
 	if err != nil {
@@ -154,20 +183,21 @@ func (c *callCtx) runGit(ctx context.Context, repoID, action string, build func(
 		credNames = append(credNames, extra...)
 	}
 
-	privateKeys, err := s.loadPrivateKeys(credNames)
-	if err != nil {
-		return "", err
-	}
-	ag, err := s.Pool.StartSession(c.sid(), privateKeys)
-	if err != nil {
-		return "", err
-	}
-	// If the agent already existed, make sure keys that became necessary only
-	// now (e.g. submodule repositories) are added to it as well.
-	if _, ok := s.Pool.Get(c.sid()); ok {
-		for _, k := range privateKeys {
-			_ = ag.AddKey(k)
+	// Only decrypt credentials the session agent does not already hold;
+	// plaintext key material exists just long enough to parse the keys.
+	missing := s.Pool.MissingKeys(c.sid(), credNames)
+	if len(missing) > 0 {
+		keys, err := s.loadPrivateKeys(missing)
+		if err != nil {
+			return "", err
 		}
+		if _, err := s.Pool.StartSession(c.sid(), keys); err != nil {
+			return "", err
+		}
+	}
+	ag, ok := s.Pool.Get(c.sid())
+	if !ok {
+		return "", fmt.Errorf("session agent not available")
 	}
 
 	containerID, err := s.Sess.EnsureContainer(ctx, c.sid(), repoID, c.user(), path, ag.Socket)
@@ -199,10 +229,14 @@ func (c *callCtx) runGit(ctx context.Context, repoID, action string, build func(
 	if execErr != nil {
 		return "", execErr
 	}
+	detail := fmt.Sprintf("exit=%d cmd=%s", code, strings.Join(cmd, " "))
+	if len(detail) > 2048 {
+		detail = detail[:2048]
+	}
 	s.Audit.Log(audit.Event{Actor: c.user(), ActorType: "user", Event: "tool",
 		Repo: repoID, Tool: cmd[1], Session: c.sid(), Credential: grant.Credential,
 		Result: map[bool]string{true: "ok", false: "error"}[code == 0],
-		Detail: fmt.Sprintf("exit=%d", code)})
+		Detail: detail})
 	if code != 0 {
 		return "", fmt.Errorf("git %s failed (exit %d): %s", cmd[1], code, sanitizeText(out))
 	}
@@ -212,13 +246,13 @@ func (c *callCtx) runGit(ctx context.Context, repoID, action string, build func(
 // loadPrivateKeys decrypts the listed credentials and parses them into crypto
 // private keys. Plaintext key bytes are zeroed immediately after parsing;
 // only the parsed key objects stay in memory.
-func (s *Server) loadPrivateKeys(credNames []string) ([]any, error) {
+func (s *Server) loadPrivateKeys(credNames []string) ([]creds.NamedKey, error) {
 	key, err := creds.GlobalMasterKey()
 	if err != nil {
 		return nil, err
 	}
 	cfg := s.Store.Get()
-	var out []any
+	var out []creds.NamedKey
 	seen := map[string]bool{}
 	for _, name := range credNames {
 		if seen[name] {
@@ -238,7 +272,7 @@ func (s *Server) loadPrivateKeys(credNames []string) ([]any, error) {
 		if perr != nil {
 			return nil, fmt.Errorf("credential %q: %w", name, perr)
 		}
-		out = append(out, raw)
+		out = append(out, creds.NamedKey{Name: name, Key: raw})
 	}
 	return out, nil
 }
@@ -458,35 +492,49 @@ func (s *Server) initTools() {
 				}
 				return []string{"git", "submodule", "update", "--init"}, nil
 			}),
-
-		repoTool("run_git",
-			"Run an allowlisted git command (e.g. [\"git\",\"log\",\"--oneline\",\"-n\",\"5\"]). Dangerous flags and subcommands are rejected.",
-			config.ActionRead,
-			objSchema(map[string]any{
-				"repo": repoProp(), "args": arrProp("full git command line, starting with \"git\""),
-			}, "repo", "args"),
-			func(c *callCtx, a map[string]any, cloned bool) ([]string, error) {
-				raw, _ := a["args"].([]any)
-				args := make([]string, 0, len(raw))
-				for _, v := range raw {
-					sv, _ := v.(string)
-					args = append(args, sv)
-				}
-				if err := gittools.CheckRunArgs(args); err != nil {
-					return nil, err
-				}
-				return args, nil
-			}),
 	}
-}
 
-// pathInside is a helper for future path-sensitive tools.
-func pathInside(root, p string) (string, error) {
-	joined := filepath.Join(root, p)
-	if !strings.HasPrefix(joined, filepath.Clean(root)+string(filepath.Separator)) {
-		return "", fmt.Errorf("path escapes repository")
-	}
-	return joined, nil
+	// run_git is registered as a read tool, but individual git subcommands
+	// require different grant actions. The Check hook re-validates the
+	// allowlisted command against the caller's grant before any workspace or
+	// container work happens (e.g. read-only grants can never push).
+	rg := repoTool("run_git",
+		"Run an allowlisted git command (e.g. [\"git\",\"log\",\"--oneline\",\"-n\",\"5\"]). Dangerous flags and subcommands are rejected; write-style subcommands require the push action.",
+		config.ActionRead,
+		objSchema(map[string]any{
+			"repo": repoProp(), "args": arrProp("full git command line, starting with \"git\""),
+		}, "repo", "args"),
+		func(c *callCtx, a map[string]any, cloned bool) ([]string, error) {
+			raw, _ := a["args"].([]any)
+			args := make([]string, 0, len(raw))
+			for _, v := range raw {
+				sv, _ := v.(string)
+				args = append(args, sv)
+			}
+			if err := gittools.CheckRunArgs(args); err != nil {
+				return nil, err
+			}
+			return args, nil
+		},
+		func(c *callCtx, a map[string]any, grant config.Grant) error {
+			repoID, err := strArg(a, "repo")
+			if err != nil {
+				return err
+			}
+			raw, _ := a["args"].([]any)
+			args := make([]string, 0, len(raw))
+			for _, v := range raw {
+				sv, _ := v.(string)
+				args = append(args, sv)
+			}
+			if err := gittools.CheckRunArgs(args); err != nil {
+				return err
+			}
+			need := gittools.RequiredAction(args)
+			if !grant.HasAction(need) {
+				return fmt.Errorf("permission denied: %s not granted on %s", need, repoID)
+			}
+			return nil
+		})
+	s.tools = append(s.tools, rg)
 }
-
-var _ = ssh.FingerprintSHA256

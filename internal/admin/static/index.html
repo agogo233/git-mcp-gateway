@@ -53,7 +53,7 @@ button.act.danger:hover{border-color:var(--bad);color:var(--bad)}
     <table id="users"></table></div>
 
   <div id="tab-repos" class="panel"><h2>仓库</h2>
-    <div class="row"><input id="r_id" placeholder="标识 org/name"><input id="r_dir" placeholder="workspace 子目录(可选)"><input id="r_branch" placeholder="默认分支(可选)"><button class="act" onclick="createRepo()">登记</button></div>
+    <div class="row"><input id="r_id" placeholder="标识 org/name"><input id="r_github" placeholder="GitHub org/name"><input id="r_dir" placeholder="workspace 子目录(可选)"><input id="r_branch" placeholder="默认分支(可选)"><button class="act" onclick="createRepo()">登记</button></div>
     <table id="repos"></table></div>
 
   <div id="tab-creds" class="panel"><h2>SSH 凭据(deploy key)</h2>
@@ -126,7 +126,7 @@ async function loadUsers(){
   (Array.isArray(us)?us:[]).forEach(u=>{ const tr=el('tr');
     tr.appendChild(el('td',u.name)); tr.appendChild(el('td',u.email));
     const td=el('td'); const rb=el('button','轮换token'); rb.className='act'; rb.onclick=async()=>{ const r=await api('/users/'+u.name+'/rotate',{method:'POST'}); msg('新 token(仅此一次)：\n'+r.token); };
-    const db=el('button','删除'); db.className='act danger'; db.onclick=async()=>{ await api('/users/'+u.name,{method:'DELETE'}); loadUsers(); };
+    const db=el('button','删除'); db.className='act danger'; db.onclick=async()=>{ if(!confirm('删除用户 '+u.name+'？')) return; await api('/users/'+u.name,{method:'DELETE'}); loadUsers(); };
     td.appendChild(rb); td.appendChild(db); tr.appendChild(td); t.appendChild(tr); });
 }
 async function createUser(){
@@ -138,11 +138,11 @@ async function loadRepos(){
   const h=el('tr'); ['标识','GitHub','子目录','操作'].forEach(x=>h.appendChild(el('th',x))); t.appendChild(h);
   Object.entries(rs||{}).forEach(([id,r])=>{ const tr=el('tr');
     tr.appendChild(el('td',id)); tr.appendChild(el('td',r.GitHub||r.github)); tr.appendChild(el('td',r.Dir||r.dir||''));
-    const td=el('td'); const db=el('button','删除'); db.className='act danger'; db.onclick=async()=>{ await api('/repos/'+encodeURIComponent(id),{method:'DELETE'}); loadRepos(); };
+    const td=el('td'); const db=el('button','删除'); db.className='act danger'; db.onclick=async()=>{ if(!confirm('删除仓库 '+id+'（含关联凭据与授权）？')) return; await api('/repos/'+encodeURIComponent(id),{method:'DELETE'}); loadRepos(); };
     td.appendChild(db); tr.appendChild(td); t.appendChild(tr); });
 }
 async function createRepo(){
-  await api('/repos', {method:'POST', body: JSON.stringify({id:$('#r_id').value.trim(), github:$('#r_id').value.trim(), dir:$('#r_dir').value.trim(), default_branch:$('#r_branch').value.trim()})});
+  await api('/repos', {method:'POST', body: JSON.stringify({id:$('#r_id').value.trim(), github:$('#r_github').value.trim(), dir:$('#r_dir').value.trim(), default_branch:$('#r_branch').value.trim()})});
   msg('仓库已登记'); loadRepos();
 }
 async function loadCreds(){
@@ -150,7 +150,7 @@ async function loadCreds(){
   const h=el('tr'); ['名称','仓库','只读','key文件','操作'].forEach(x=>h.appendChild(el('th',x))); t.appendChild(h);
   (Array.isArray(cs)?cs:[]).forEach(c=>{ const tr=el('tr');
     tr.appendChild(el('td',c.name)); tr.appendChild(el('td',c.repo)); tr.appendChild(el('td',c.readonly?'是':'否')); tr.appendChild(el('td',c.key_file));
-    const td=el('td'); const db=el('button','删除'); db.className='act danger'; db.onclick=async()=>{ await api('/credentials/'+encodeURIComponent(c.name),{method:'DELETE'}); loadCreds(); };
+    const td=el('td'); const db=el('button','删除'); db.className='act danger'; db.onclick=async()=>{ if(!confirm('删除凭据 '+c.name+'？')) return; await api('/credentials/'+encodeURIComponent(c.name),{method:'DELETE'}); loadCreds(); };
     td.appendChild(db); tr.appendChild(td); t.appendChild(tr); });
 }
 async function createCred(){

@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -30,6 +31,13 @@ import (
 
 //go:embed all:static
 var staticFS embed.FS
+
+// Admin-supplied names must be safe path elements: credentials become
+// /keys/<name>.age files and repo ids/dirs feed workspace paths.
+var (
+	namePattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	repoIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+)
 
 // Server is the admin console.
 type Server struct {
@@ -195,7 +203,7 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	s.audit("admin", "config", "user "+in.Name+" created")
+	s.audit("user " + in.Name + " created")
 	writeJSON(w, http.StatusOK, map[string]string{"name": in.Name, "token": token})
 }
 
@@ -223,7 +231,7 @@ func (s *Server) rotateUser(w http.ResponseWriter, r *http.Request, name string)
 		writeJSON(w, 404, map[string]string{"error": err.Error()})
 		return
 	}
-	s.audit("admin", "config", "token rotated for "+name)
+	s.audit("token rotated for " + name)
 	writeJSON(w, http.StatusOK, map[string]string{"name": name, "token": token})
 }
 
@@ -246,7 +254,7 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request, name string)
 		writeJSON(w, 404, map[string]string{"error": err.Error()})
 		return
 	}
-	s.audit("admin", "config", "user deleted: "+name)
+	s.audit("user deleted: " + name)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
 
@@ -265,6 +273,14 @@ func (s *Server) upsertRepo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "id and github (org/name) are required"})
 		return
 	}
+	if !repoIDPattern.MatchString(in.ID) {
+		writeJSON(w, 400, map[string]string{"error": "id must be org/name using only [A-Za-z0-9._-]"})
+		return
+	}
+	if in.Dir != "" && !namePattern.MatchString(in.Dir) {
+		writeJSON(w, 400, map[string]string{"error": "dir must be a single safe path element"})
+		return
+	}
 	err := s.Store.Update(func(c *config.Config) error {
 		c.Repos[in.ID] = config.Repo{GitHub: in.GitHub, Dir: in.Dir, DefaultBranch: in.DefaultBranch}
 		return nil
@@ -273,7 +289,7 @@ func (s *Server) upsertRepo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	s.audit("admin", "config", "repo upserted: "+in.ID)
+	s.audit("repo upserted: " + in.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
 
@@ -301,7 +317,7 @@ func (s *Server) deleteRepo(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSON(w, 404, map[string]string{"error": err.Error()})
 		return
 	}
-	s.audit("admin", "config", "repo deleted: "+id)
+	s.audit("repo deleted: " + id)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
 
@@ -327,6 +343,10 @@ func (s *Server) createCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Name == "" || in.Repo == "" {
 		writeJSON(w, 400, map[string]string{"error": "name and repo are required"})
+		return
+	}
+	if !namePattern.MatchString(in.Name) {
+		writeJSON(w, 400, map[string]string{"error": "credential name must contain only [A-Za-z0-9._-] and start with a letter or digit"})
 		return
 	}
 	cfg := s.Store.Get()
@@ -380,7 +400,7 @@ func (s *Server) createCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	sshPub := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPubKey)))
 	fingerprint := ssh.FingerprintSHA256(sshPubKey)
-	s.audit("admin", "config", "credential created: "+in.Name+" ("+in.Repo+")")
+	s.audit("credential created: " + in.Name + " (" + in.Repo + ")")
 	writeJSON(w, http.StatusOK, map[string]string{
 		"name": in.Name, "repo": in.Repo, "readonly": fmt.Sprintf("%v", in.ReadOnly),
 		"public_key": sshPub, "fingerprint": fingerprint,
@@ -389,10 +409,13 @@ func (s *Server) createCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteCredential(w http.ResponseWriter, r *http.Request, name string) {
+	keyFile := ""
 	err := s.Store.Update(func(c *config.Config) error {
-		if _, ok := c.Credentials[name]; !ok {
+		cred, ok := c.Credentials[name]
+		if !ok {
 			return fmt.Errorf("credential %q not found", name)
 		}
+		keyFile = cred.KeyFile
 		delete(c.Credentials, name)
 		kept := c.Grants[:0]
 		for _, g := range c.Grants {
@@ -407,7 +430,14 @@ func (s *Server) deleteCredential(w http.ResponseWriter, r *http.Request, name s
 		writeJSON(w, 404, map[string]string{"error": err.Error()})
 		return
 	}
-	s.audit("admin", "config", "credential deleted: "+name)
+	// remove the encrypted key blob so no orphaned secret material is left
+	// on disk after the credential is gone
+	if keyFile != "" {
+		if rmErr := osRemove(keyFile); rmErr != nil && !os.IsNotExist(rmErr) {
+			s.audit("credential deleted: " + name + " (key file removal failed: " + rmErr.Error() + ")")
+		}
+	}
+	s.audit("credential deleted: " + name)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
 
@@ -432,7 +462,7 @@ func (s *Server) putGrants(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	s.audit("admin", "config", fmt.Sprintf("grants replaced (%d entries)", len(in.Grants)))
+	s.audit(fmt.Sprintf("grants replaced (%d entries)", len(in.Grants)))
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
 
@@ -463,17 +493,8 @@ func (s *Server) unlock(w http.ResponseWriter, r *http.Request) {
 		s.Repos.Release(l.Repo, l.SessionID)
 		freed = append(freed, l.SessionID)
 	}
-	s.audit("admin", "admin", "forced unlock of "+in.Repo+" (sessions: "+strings.Join(freed, ",")+")")
+	s.auditOp("forced unlock of " + in.Repo + " (sessions: " + strings.Join(freed, ",") + ")")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "released_sessions": freed})
-}
-
-func (s *Server) sessionHasContainers(repo string) bool {
-	for _, a := range s.Sess.ActiveSessions() {
-		if a.Repo == repo {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) fixWorkspace(w http.ResponseWriter, r *http.Request) {
@@ -489,12 +510,19 @@ func (s *Server) fixWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	s.audit("admin", "admin", "workspace fix for "+in.Repo+": removed "+strings.Join(removed, ","))
+	s.auditOp("workspace fix for " + in.Repo + ": removed " + strings.Join(removed, ","))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed})
 }
 
-func (s *Server) audit(actor, actorType, detail string) {
-	s.Audit.Log(audit.Event{Actor: actor, ActorType: actorType, Event: "config",
+func (s *Server) audit(detail string) {
+	s.Audit.Log(audit.Event{Actor: "admin", ActorType: "admin", Event: "config",
+		Result: "ok", Detail: sanitize.Clean(detail), TS: time.Now()})
+}
+
+// auditOp records an operational (non-config) admin action such as forced
+// unlocks or workspace repair.
+func (s *Server) auditOp(detail string) {
+	s.Audit.Log(audit.Event{Actor: "admin", ActorType: "admin", Event: "admin",
 		Result: "ok", Detail: sanitize.Clean(detail), TS: time.Now()})
 }
 
@@ -502,6 +530,9 @@ func (s *Server) audit(actor, actorType, detail string) {
 var osWriteFile = func(path string, data []byte) error {
 	return os.WriteFile(path, data, 0o600)
 }
+
+// osRemove is a hook so key file cleanup can be observed in tests.
+var osRemove = os.Remove
 
 func decode(r *http.Request, v any) error {
 	defer r.Body.Close()

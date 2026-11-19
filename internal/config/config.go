@@ -15,12 +15,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
+)
+
+// Identifier patterns: repo ids are "org/name", everything else
+// (workspace dir, credential names) must be a single safe path element.
+// These guards also keep admin-supplied names from escaping the workspace
+// or key directories ("..", "/", embedded separators).
+var (
+	repoIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	namePattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
 
 // Actions that may be granted on a repository.
@@ -193,42 +203,58 @@ func (s *Store) watch() {
 }
 
 // Update applies a mutation to the in-memory configuration, persists the
-// changed files and re-validates from disk. On any failure the previously
-// known-good configuration is restored.
+// changed files and re-validates from disk. The mutation runs on a deep copy
+// of the current configuration, so concurrent readers never see a half-mutated
+// snapshot and a failed change simply drops the copy.
 func (s *Store) Update(mutate func(*Config) error) error {
-	s.mu.Lock()
-	old := s.cur
-	cur := s.cur
-	s.mu.Unlock()
+	s.mu.RLock()
+	cur := deepCopyConfig(s.cur)
+	s.mu.RUnlock()
 
 	if err := mutate(cur); err != nil {
 		return err
 	}
 	if err := SaveUsers(s.dir, cur.Users, cur.AdminToken); err != nil {
-		s.mu.Lock()
-		s.cur = old
-		s.mu.Unlock()
 		return err
 	}
 	if err := SaveGrants(s.dir, cur.Credentials, cur.Grants); err != nil {
-		s.mu.Lock()
-		s.cur = old
-		s.mu.Unlock()
 		return err
 	}
 	if err := SaveRepos(s.dir, cur.WorkspaceRoot, cur.Repos); err != nil {
-		s.mu.Lock()
-		s.cur = old
-		s.mu.Unlock()
 		return err
 	}
 	if err := s.reload(); err != nil {
-		s.mu.Lock()
-		s.cur = old
-		s.mu.Unlock()
 		return fmt.Errorf("change rejected by validation: %w", err)
 	}
 	return nil
+}
+
+// deepCopyConfig returns a copy whose maps and slices are independent of the
+// original, safe to mutate without holding the store lock.
+func deepCopyConfig(c *Config) *Config {
+	if c == nil {
+		return &Config{}
+	}
+	out := &Config{
+		AdminToken:    c.AdminToken,
+		WorkspaceRoot: c.WorkspaceRoot,
+		Server:        c.Server,
+		Users:         make(map[string]User, len(c.Users)),
+		Credentials:   make(map[string]Credential, len(c.Credentials)),
+		Repos:         make(map[string]Repo, len(c.Repos)),
+		Grants:        make([]Grant, len(c.Grants)),
+	}
+	for k, v := range c.Users {
+		out.Users[k] = v
+	}
+	for k, v := range c.Credentials {
+		out.Credentials[k] = v
+	}
+	for k, v := range c.Repos {
+		out.Repos[k] = v
+	}
+	copy(out.Grants, c.Grants)
+	return out
 }
 
 func (s *Store) reload() error {
@@ -359,14 +385,20 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one repo must be defined")
 	}
 	for id, r := range c.Repos {
+		if !repoIDPattern.MatchString(id) {
+			return fmt.Errorf("repo id %q must be org/name using only [A-Za-z0-9._-]", id)
+		}
 		if !strings.Contains(r.GitHub, "/") {
 			return fmt.Errorf("repo %q: github must be org/name", id)
 		}
-		if r.Dir != "" && strings.ContainsAny(r.Dir, "/\\") {
-			return fmt.Errorf("repo %q: dir must be a single path element", id)
+		if r.Dir != "" && !namePattern.MatchString(r.Dir) {
+			return fmt.Errorf("repo %q: dir must be a single safe path element", id)
 		}
 	}
 	for name, cred := range c.Credentials {
+		if !namePattern.MatchString(name) {
+			return fmt.Errorf("credential name %q must contain only [A-Za-z0-9._-]", name)
+		}
 		if _, ok := c.Repos[cred.Repo]; !ok {
 			return fmt.Errorf("credential %q references unknown repo %q", name, cred.Repo)
 		}

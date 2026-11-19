@@ -81,6 +81,14 @@ func main() {
 	if err != nil {
 		fatal("docker session manager: %v", err)
 	}
+	// Fail fast when the Docker daemon is unreachable instead of starting up
+	// half-broken and only noticing on the first tool call.
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := sessMgr.Ping(pingCtx); err != nil {
+		cancelPing()
+		fatal("docker daemon unreachable: %v", err)
+	}
+	cancelPing()
 	orphans, err := sessMgr.KillOrphans(context.Background())
 	if err != nil {
 		auditLog.Log(audit.Event{Actor: "system", ActorType: "system", Event: "session",
