@@ -1,0 +1,9 @@
+server:
+  addr: ":8443"
+  session_image: git-mcp-session:local   # 或 ghcr.io/<owner>/git-mcp-session:latest
+  session_ttl: 30m                       # 空闲会话回收
+  exec_timeout: 120s                     # 单条 git 命令超时
+  max_output_bytes: 1048576
+  socket_dir: /run/git-mcp/agents
+  audit_file: /var/log/git-mcp/audit.jsonl
+  github_host: github.com

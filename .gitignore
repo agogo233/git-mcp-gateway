@@ -1,0 +1,9 @@
+# 真实配置与密钥永不入库，仅 example 入库
+config/users.yaml
+config/grants.yaml
+config/repos.yaml
+config/server.yaml
+*.age
+.env
+git-mcp-gateway
+ci-cfg/

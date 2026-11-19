@@ -1,0 +1,39 @@
+# git-mcp-gateway — 独立部署，接入 OpenCodeUI 的 opencode-net 外部网络。
+#
+# 前置条件（见 README）：
+#   1. docker network create opencode-net   （OpenCodeUI 已创建则跳过）
+#   2. 目录：/var/lib/git-mcp/keys、/run/git-mcp、/var/log/git-mcp、$WORKSPACE_ROOT
+#   3. .env 中设置 GIT_MCP_MASTER_KEY（32 字节 base64）
+#
+# 注意：repos.yaml 里的 workspace_root 必须与 WORKSPACE_ROOT 的宿主机绝对路径
+# 一致（gateway 容器内挂载点与宿主机路径相同，Docker bind mount 才能对上）。
+
+services:
+  git-mcp-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+    image: git-mcp-gateway:local
+    container_name: git-mcp-gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_ADDR:-0.0.0.0}:8443:8443"
+    environment:
+      - GIT_MCP_MASTER_KEY=${GIT_MCP_MASTER_KEY}
+    volumes:
+      - ../config:/etc/git-mcp-gateway:ro
+      - /var/lib/git-mcp/keys:/keys:ro
+      - ${WORKSPACE_ROOT:-/srv/workspaces}:/srv/workspaces
+      - /run/git-mcp:/run/git-mcp
+      - /var/log/git-mcp:/var/log/git-mcp
+      - /var/run/docker.sock:/var/run/docker.sock
+    # 宿主机 docker 组 gid（默认 999），让 gateway 能编排会话容器
+    group_add:
+      - "${DOCKER_GID:-999}"
+    networks:
+      - opencode-net
+
+networks:
+  opencode-net:
+    external: true
+    name: opencode-net

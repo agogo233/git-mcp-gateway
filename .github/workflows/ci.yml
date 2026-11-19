@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to commit SHAs of the referenced major-version tags
+      # (supply-chain hardening; re-check on version bumps).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "unformatted files: $unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./... -race -count=1
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build gateway image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.gateway
+          push: false
+          load: true
+          tags: git-mcp-gateway:ci
+          cache-from: type=gha,mode=max
+          cache-to: type=gha,mode=max
+
+      - name: Build session image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.session
+          push: false
+          load: true
+          tags: git-mcp-session:ci
+          cache-from: type=gha,mode=max
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test gateway
+        run: |
+          set -e
+          export GIT_MCP_MASTER_KEY=$(openssl rand -base64 32)
+          HASH=$(docker run --rm git-mcp-gateway:ci keytool hash -t ci-test-token)
+          HASH2=$(docker run --rm git-mcp-gateway:ci keytool hash -t ci-admin-token)
+          mkdir -p ci-cfg
+          cat > ci-cfg/server.yaml <<EOF
+          server:
+            addr: ":8443"
+            session_image: git-mcp-session:ci
+            socket_dir: /tmp/gmcp/agents
+            audit_file: /tmp/gmcp/audit.jsonl
+          EOF
+          cat > ci-cfg/users.yaml <<EOF
+          users:
+            alice:
+              token_hash: "$HASH"
+              name: Alice
+              email: alice@example.com
+          admin_token_hash: "$HASH2"
+          EOF
+          cat > ci-cfg/grants.yaml <<EOF
+          credentials:
+            k1:
+              repo: test/repo
+              readonly: false
+              key_file: /keys/k1.age
+          grants:
+            - user: alice
+              repo: test/repo
+              actions: [read, clone, push]
+              credential: k1
+          EOF
+          cat > ci-cfg/repos.yaml <<EOF
+          workspace_root: /tmp/gmcp/ws
+          repos:
+            test/repo:
+              github: test/repo
+          EOF
+          docker run -d --name gw -e GIT_MCP_MASTER_KEY -v "$PWD/ci-cfg:/etc/git-mcp-gateway:ro" -p 18443:8443 git-mcp-gateway:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:18443/healthz | grep -q '"version"'; then
+              curl -s http://127.0.0.1:18443/healthz
+              docker rm -f gw >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs gw
+          docker rm -f gw >/dev/null || true
+          exit 1
+
+      - name: Smoke test session image (must contain no credentials)
+        run: |
+          set -e
+          docker run --rm git-mcp-session:ci sh -c 'git --version && ssh -V && test -s /home/gitmcp/.ssh/known_hosts'
+          if docker run --rm git-mcp-session:ci sh -c 'find / -xdev \( -name "id_ed25519" -o -name "id_rsa" -o -name "*.age" -o -name "authorized_keys" \) 2>/dev/null | grep -q .'; then
+            echo "session image must not contain credential files"
+            exit 1
+          fi
+          echo "session image credential scan passed"

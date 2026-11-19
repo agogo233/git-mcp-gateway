@@ -1,0 +1,20 @@
+# Session image: the only thing an agent's git session can touch.
+# It contains git + ssh and NO credentials of any kind; the ssh-agent socket
+# is bind-mounted per session by the gateway.
+FROM alpine:3.20
+
+RUN apk add --no-cache git openssh-client ca-certificates \
+ && addgroup -g 1000 gitmcp \
+ && adduser -D -u 1000 -G gitmcp gitmcp \
+ && mkdir -p /home/gitmcp/.ssh /ssh-agent \
+ && ssh-keyscan -t ed25519,ecdsa github.com ssh.github.com > /home/gitmcp/.ssh/known_hosts 2>/dev/null \
+ && printf 'Host *\n  StrictHostKeyChecking yes\n  UserKnownHostsFile /home/gitmcp/.ssh/known_hosts\n' > /home/gitmcp/.ssh/config \
+ && git config --system --add safe.directory '*' \
+ && chmod 700 /home/gitmcp/.ssh
+
+# known_hosts are pinned at build time (image is immutable afterwards);
+# rebuild the image to pick up GitHub host key rotations.
+USER 1000:1000
+ENV GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=yes"
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

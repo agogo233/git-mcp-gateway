@@ -1,0 +1,10 @@
+# 持久工作区：OpenCodeUI backend 挂载的 workspace 目录（宿主机绝对路径），
+# 其下每个子目录是一个仓库的持久工作区。工具参数 repo = 这里的 key（org/name）。
+workspace_root: /srv/workspaces
+repos:
+  accountA/repoA:
+    github: "accountA/repoA"
+    dir: repoA            # 即 /srv/workspaces/repoA
+  accountB/repoB:
+    github: "accountB/repoB"
+    dir: repoB

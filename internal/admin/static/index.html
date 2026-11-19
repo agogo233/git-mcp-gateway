@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>git-mcp-gateway 管理台</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#2d333b;--fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--bad:#f85149;--warn:#d29922}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.6 ui-monospace,Consolas,"PingFang SC","Microsoft YaHei",monospace;padding:20px}
+h1{font-size:18px;margin-bottom:4px}
+.sub{color:var(--muted);font-size:12px;margin-bottom:16px}
+.login{max-width:420px;margin:80px auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px}
+.login input{width:100%;margin:12px 0}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.tabs button{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 14px;cursor:pointer;font:inherit;font-size:13px}
+.tabs button.on{border-color:var(--accent);color:var(--accent)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.panel h2{font-size:13px;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.06em}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);word-break:break-all}
+th{color:var(--muted);font-weight:600}
+input,textarea,select{background:#0d1117;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:6px 8px;font:inherit;font-size:13px}
+textarea{width:100%;min-height:160px}
+button.act{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit;font-size:12px;margin-right:6px}
+button.act:hover{border-color:var(--accent);color:var(--accent)}
+button.act.danger:hover{border-color:var(--bad);color:var(--bad)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}
+.one{color:var(--warn);white-space:pre-wrap;word-break:break-all}
+.ok{color:var(--ok)} .bad{color:var(--bad)} .muted{color:var(--muted)}
+#msg{position:fixed;right:16px;bottom:16px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 14px;display:none;max-width:480px;white-space:pre-wrap}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<div id="login" class="login">
+  <h1>git-mcp-gateway</h1>
+  <div class="sub">输入管理员 token 登录管理台</div>
+  <input id="tok" type="password" placeholder="admin token">
+  <button class="act" onclick="login()">登录</button>
+  <div id="loginErr" class="bad"></div>
+</div>
+
+<div id="main" class="hidden">
+  <h1>git-mcp-gateway 管理台</h1>
+  <div class="sub" id="ver"></div>
+  <div class="tabs" id="tabs"></div>
+
+  <div id="tab-overview" class="panel"><h2>概览</h2><div id="ov"></div></div>
+
+  <div id="tab-users" class="panel"><h2>用户</h2>
+    <div class="row"><input id="u_name" placeholder="用户名"><input id="u_email" placeholder="邮箱(提交作者)"><button class="act" onclick="createUser()">创建(返回一次性 token)</button></div>
+    <table id="users"></table></div>
+
+  <div id="tab-repos" class="panel"><h2>仓库</h2>
+    <div class="row"><input id="r_id" placeholder="标识 org/name"><input id="r_dir" placeholder="workspace 子目录(可选)"><input id="r_branch" placeholder="默认分支(可选)"><button class="act" onclick="createRepo()">登记</button></div>
+    <table id="repos"></table></div>
+
+  <div id="tab-creds" class="panel"><h2>SSH 凭据(deploy key)</h2>
+    <div class="row"><input id="c_name" placeholder="凭据名"><input id="c_repo" placeholder="仓库 org/name"><label><input type="checkbox" id="c_ro"> 只读</label><button class="act" onclick="createCred()">生成(返回一次性公钥)</button></div>
+    <div id="credOne" class="one"></div>
+    <table id="creds"></table></div>
+
+  <div id="tab-grants" class="panel"><h2>授权表(整体替换)</h2>
+    <textarea id="grantsTxt" spellcheck="false"></textarea>
+    <div class="row"><button class="act" onclick="saveGrants()">保存并校验</button><span class="muted">格式: [{"user":"alice","repo":"org/name","actions":["read","clone","push"],"credential":"key-alice"}]</span></div></div>
+
+  <div id="tab-audit" class="panel"><h2>审计日志(最近 200 条)</h2><div class="row"><button class="act" onclick="loadAudit()">刷新</button></div><table id="audit"></table></div>
+
+  <div id="tab-locks" class="panel"><h2>会话锁与工作区</h2>
+    <div class="row"><input id="lk_repo" placeholder="仓库 org/name"><button class="act danger" onclick="unlock()">强制解锁(并终止容器)</button><button class="act" onclick="fixWs()">修复工作区锁文件</button></div>
+    <table id="locks"></table></div>
+
+  <button class="act" onclick="logout()">退出</button>
+</div>
+<div id="msg"></div>
+<script>
+let TOKEN = sessionStorage.getItem('gmcp_tok') || '';
+const $ = s => document.querySelector(s);
+function el(tag, text){ const e=document.createElement(tag); if(text!==undefined) e.textContent=text; return e; }
+function msg(t, bad){ const m=$('#msg'); m.textContent=t; m.style.display='block'; m.className=bad?'bad':''; setTimeout(()=>m.style.display='none', 5000); }
+async function api(path, opts={}){
+  const r = await fetch('/admin/api'+path, Object.assign({}, opts, {headers:Object.assign({'Authorization':'Bearer '+TOKEN, 'Content-Type':'application/json'}, opts.headers||{})}));
+  if(r.status===401){ logout(); throw new Error('unauthorized'); }
+  const t = await r.text();
+  let j; try{ j = JSON.parse(t); }catch(e){ j = {raw:t}; }
+  if(!r.ok) throw new Error(j.error || t);
+  return j;
+}
+function login(){ TOKEN = $('#tok').value.trim(); sessionStorage.setItem('gmcp_tok', TOKEN); load(); }
+function logout(){ sessionStorage.removeItem('gmcp_tok'); TOKEN=''; location.reload(); }
+const TABS = [['overview','概览'],['users','用户'],['repos','仓库'],['creds','凭据'],['grants','授权'],['audit','审计'],['locks','锁']];
+function showTab(id){
+  TABS.forEach(([t])=>$('#tab-'+t).classList.toggle('hidden', t!==id));
+  document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on', b.dataset.t===id));
+  ({overview:loadOverview, users:loadUsers, repos:loadRepos, creds:loadCreds, grants:loadGrants, audit:loadAudit, locks:loadLocks})[id]();
+}
+async function load(){
+  try{ const ov = await api('/overview'); }
+  catch(e){ $('#loginErr').textContent = e.message; return; }
+  $('#login').classList.add('hidden'); $('#main').classList.remove('hidden');
+  const tabs = $('#tabs'); tabs.textContent='';
+  TABS.forEach(([t,label])=>{ const b=el('button',label); b.dataset.t=t; b.onclick=()=>showTab(t); tabs.appendChild(b); });
+  showTab('overview');
+}
+async function loadOverview(){
+  const ov = await api('/overview');
+  $('#ver').textContent = 'version ' + (ov.version||'?') + ' · agents ' + (ov.agents||0);
+  const d = $('#ov'); d.textContent='';
+  const t = el('table'); const h = el('tr');
+  ['活动会话','用户','仓库','容器'].forEach(x=>h.appendChild(el('th',x)));
+  t.appendChild(h);
+  const sess = ov.sessions||[];
+  if(sess.length===0){ const tr=el('tr'); tr.appendChild(el('td','（无活动会话）')); t.appendChild(tr); }
+  sess.forEach(s=>{ const tr=el('tr');
+    tr.appendChild(el('td', s.SessionID||s.session_id||''));
+    tr.appendChild(el('td', s.User||s.user||''));
+    tr.appendChild(el('td', s.Repo||s.repo||''));
+    tr.appendChild(el('td', (s.Container||s.container||'').slice(0,12)));
+    t.appendChild(tr); });
+  d.appendChild(t);
+}
+async function loadUsers(){
+  const us = await api('/users'); const t=$('#users'); t.textContent='';
+  const h=el('tr'); ['用户','邮箱','操作'].forEach(x=>h.appendChild(el('th',x))); t.appendChild(h);
+  (Array.isArray(us)?us:[]).forEach(u=>{ const tr=el('tr');
+    tr.appendChild(el('td',u.name)); tr.appendChild(el('td',u.email));
+    const td=el('td'); const rb=el('button','轮换token'); rb.className='act'; rb.onclick=async()=>{ const r=await api('/users/'+u.name+'/rotate',{method:'POST'}); msg('新 token(仅此一次)：\n'+r.token); };
+    const db=el('button','删除'); db.className='act danger'; db.onclick=async()=>{ await api('/users/'+u.name,{method:'DELETE'}); loadUsers(); };
+    td.appendChild(rb); td.appendChild(db); tr.appendChild(td); t.appendChild(tr); });
+}
+async function createUser(){
+  const r = await api('/users', {method:'POST', body: JSON.stringify({name:$('#u_name').value.trim(), email:$('#u_email').value.trim()})});
+  msg('用户已创建，token(仅此一次)：\n'+r.token); loadUsers();
+}
+async function loadRepos(){
+  const rs = await api('/repos'); const t=$('#repos'); t.textContent='';
+  const h=el('tr'); ['标识','GitHub','子目录','操作'].forEach(x=>h.appendChild(el('th',x))); t.appendChild(h);
+  Object.entries(rs||{}).forEach(([id,r])=>{ const tr=el('tr');
+    tr.appendChild(el('td',id)); tr.appendChild(el('td',r.GitHub||r.github)); tr.appendChild(el('td',r.Dir||r.dir||''));
+    const td=el('td'); const db=el('button','删除'); db.className='act danger'; db.onclick=async()=>{ await api('/repos/'+encodeURIComponent(id),{method:'DELETE'}); loadRepos(); };
+    td.appendChild(db); tr.appendChild(td); t.appendChild(tr); });
+}
+async function createRepo(){
+  await api('/repos', {method:'POST', body: JSON.stringify({id:$('#r_id').value.trim(), github:$('#r_id').value.trim(), dir:$('#r_dir').value.trim(), default_branch:$('#r_branch').value.trim()})});
+  msg('仓库已登记'); loadRepos();
+}
+async function loadCreds(){
+  const cs = await api('/credentials'); const t=$('#creds'); t.textContent='';
+  const h=el('tr'); ['名称','仓库','只读','key文件','操作'].forEach(x=>h.appendChild(el('th',x))); t.appendChild(h);
+  (Array.isArray(cs)?cs:[]).forEach(c=>{ const tr=el('tr');
+    tr.appendChild(el('td',c.name)); tr.appendChild(el('td',c.repo)); tr.appendChild(el('td',c.readonly?'是':'否')); tr.appendChild(el('td',c.key_file));
+    const td=el('td'); const db=el('button','删除'); db.className='act danger'; db.onclick=async()=>{ await api('/credentials/'+encodeURIComponent(c.name),{method:'DELETE'}); loadCreds(); };
+    td.appendChild(db); tr.appendChild(td); t.appendChild(tr); });
+}
+async function createCred(){
+  const r = await api('/credentials', {method:'POST', body: JSON.stringify({name:$('#c_name').value.trim(), repo:$('#c_repo').value.trim(), readonly:$('#c_ro').checked})});
+  $('#credOne').textContent = '公钥(登记到 GitHub 仓库 Deploy keys 后即可使用)：\n' + r.public_key + '\n指纹: ' + r.fingerprint;
+  loadCreds();
+}
+async function loadGrants(){
+  const g = await api('/grants'); $('#grantsTxt').value = JSON.stringify(g.grants||[], null, 2);
+}
+async function saveGrants(){
+  let grants; try{ grants = JSON.parse($('#grantsTxt').value); }catch(e){ msg('JSON 解析失败：'+e.message, true); return; }
+  await api('/grants', {method:'PUT', body: JSON.stringify({grants})});
+  msg('授权表已保存并通过校验'); loadGrants();
+}
+async function loadAudit(){
+  const evs = await api('/audit?n=200'); const t=$('#audit'); t.textContent='';
+  const h=el('tr'); ['时间','主体','事件','仓库','结果','详情'].forEach(x=>h.appendChild(el('th',x))); t.appendChild(h);
+  (Array.isArray(evs)?evs:[]).forEach(e=>{ const tr=el('tr');
+    tr.appendChild(el('td', (e.ts||'').replace('T',' ').slice(0,19)));
+    tr.appendChild(el('td', (e.actor_type||'')+':'+(e.actor||'')));
+    tr.appendChild(el('td', e.event||'')); tr.appendChild(el('td', e.repo||''));
+    const r=el('td', e.result||''); r.className = e.result==='ok'?'ok':(e.result==='denied'?'bad':''); tr.appendChild(r);
+    tr.appendChild(el('td', e.detail||'')); t.appendChild(tr); });
+}
+async function loadLocks(){
+  const ov = await api('/overview'); const t=$('#locks'); t.textContent='';
+  const h=el('tr'); ['仓库','会话','用户','获得时间','最近使用'].forEach(x=>h.appendChild(el('th',x))); t.appendChild(h);
+  const locks = ov.locks||[];
+  if(locks.length===0){ const tr=el('tr'); tr.appendChild(el('td','（无锁）')); t.appendChild(tr); }
+  locks.forEach(l=>{ const tr=el('tr');
+    tr.appendChild(el('td',l.Repo||l.repo)); tr.appendChild(el('td',l.SessionID||l.session_id));
+    tr.appendChild(el('td',l.User||l.user)); tr.appendChild(el('td',l.Acquired||l.acquired||''));
+    tr.appendChild(el('td',l.LastUsed||l.last_used||'')); t.appendChild(tr); });
+}
+async function unlock(){
+  const r = await api('/locks/unlock', {method:'POST', body: JSON.stringify({repo:$('#lk_repo').value.trim()})});
+  msg('已解锁: ' + JSON.stringify(r.released_sessions||[])); loadLocks();
+}
+async function fixWs(){
+  const r = await api('/workspace/fix', {method:'POST', body: JSON.stringify({repo:$('#lk_repo').value.trim()})});
+  msg('已清理: ' + JSON.stringify(r.removed||[]));
+}
+if(TOKEN) load();
+</script>
+</body>
+</html>

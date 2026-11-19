@@ -1,0 +1,15 @@
+# 用户与 token（bcrypt 哈希）。
+# 生成哈希：  docker run --rm git-mcp-gateway:local keytool hash -t <明文token>
+# 或在管理台“用户”页创建（明文 token 只显示一次）。
+users:
+  alice:
+    token_hash: "$2a$10$REPLACE_WITH_BCRYPT_HASH"
+    name: Alice
+    email: alice@corp.com        # 作为 GIT_AUTHOR_NAME/EMAIL 注入会话容器
+  bob:
+    token_hash: "$2a$10$REPLACE_WITH_BCRYPT_HASH"
+    name: Bob
+    email: bob@corp.com
+
+# 管理台 token（与用户 token 分开保管）
+admin_token_hash: "$2a$10$REPLACE_WITH_BCRYPT_HASH"

@@ -1,0 +1,23 @@
+# SSH 凭据（GitHub deploy key，一把 key 只能绑定一个仓库）与授权表。
+# 生成凭据：管理台“凭据”页创建，或在服务器上执行
+#   git-mcp-gateway keytool gen-deploy-key -name git-mcp:alice -pub /tmp/alice.pub -o /var/lib/git-mcp/keys/key-alice.age
+# 然后把公钥登记到 GitHub 仓库 Settings → Deploy keys（需要 push 就勾选 Allow write access）。
+credentials:
+  key-alice-repoa:
+    repo: "accountA/repoA"
+    readonly: false
+    key_file: "/keys/key-alice-repoa.age"
+  key-bob-repob:
+    repo: "accountB/repoB"
+    readonly: true
+    key_file: "/keys/key-bob-repob.age"
+
+grants:
+  - user: alice
+    repo: "accountA/repoA"
+    actions: [read, clone, push]
+    credential: key-alice-repoa
+  - user: bob
+    repo: "accountB/repoB"
+    actions: [read, clone]
+    credential: key-bob-repob
