@@ -69,13 +69,10 @@ func TestCreateCredentialRejectsBadName(t *testing.T) {
 
 func TestDeleteCredentialRemovesKeyFile(t *testing.T) {
 	s := newTestAdmin(t)
-	keyFile := ""
 	cfg := s.Store.Get()
-	for _, c := range cfg.Credentials {
-		keyFile = c.KeyFile
-	}
+	keyFile := cfg.Credentials["key-alice"].KeyFile
 	if keyFile == "" {
-		t.Fatal("test config must define a key file")
+		t.Fatal("test config must define a key file for key-alice")
 	}
 	if err := os.WriteFile(keyFile, []byte("secret"), 0o600); err != nil {
 		t.Fatal(err)

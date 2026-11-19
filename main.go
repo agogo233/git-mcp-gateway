@@ -81,12 +81,13 @@ func main() {
 	if err != nil {
 		fatal("docker session manager: %v", err)
 	}
-	// Fail fast when the Docker daemon is unreachable instead of starting up
-	// half-broken and only noticing on the first tool call.
+	// Report an unreachable Docker daemon at startup, but do not abort: the
+	// gateway can still serve /healthz and the admin console, and the CI
+	// smoke test intentionally starts the image without a docker socket.
 	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := sessMgr.Ping(pingCtx); err != nil {
-		cancelPing()
-		fatal("docker daemon unreachable: %v", err)
+		auditLog.Log(audit.Event{Actor: "system", ActorType: "system", Event: "session",
+			Result: "error", Detail: "docker daemon unreachable at startup: " + err.Error()})
 	}
 	cancelPing()
 	orphans, err := sessMgr.KillOrphans(context.Background())
