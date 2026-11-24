@@ -18,8 +18,8 @@ var patterns = []struct {
 	{regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`), "[github token removed]"},
 	// JWT-shaped blobs.
 	{regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.?[A-Za-z0-9_.-]*`), "[jwt removed]"},
-	// URL embedded credentials: scheme://user:pass@host
-	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@`), "${1}[cred]@"},
+	// URL embedded credentials: scheme://user:pass@host or scheme://token@host
+	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+(:[^/\s@]+)?@`), "${1}[cred]@"},
 	// keyword=value style leaks in git/ssh diagnostics.
 	{regexp.MustCompile(`(?i)(token|password|passwd|secret|api[_-]?key|authorization)(["']?\s*[:=]\s*["']?)[A-Za-z0-9_\-./+=]{8,}`), "${1}${2}[redacted]"},
 }
