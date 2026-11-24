@@ -91,3 +91,24 @@ func TestInitializeUnknownSessionCreatesNew(t *testing.T) {
 		t.Fatal("must not trust a client-supplied unknown session id")
 	}
 }
+
+func TestInitializeSessionLimit(t *testing.T) {
+	srv, tk := newTestServer(t)
+	// the default limit is 4: the fifth initialize for one user is rejected
+	for i := 0; i < 4; i++ {
+		req := initReq("")
+		req.Header.Set("Authorization", "Bearer "+tk.alice)
+		rec := httptest.NewRecorder()
+		srv.handleMCP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("initialize %d should succeed: %d %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	req := initReq("")
+	req.Header.Set("Authorization", "Bearer "+tk.alice)
+	rec := httptest.NewRecorder()
+	srv.handleMCP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on the fifth session, got %d %s", rec.Code, rec.Body.String())
+	}
+}

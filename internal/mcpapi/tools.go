@@ -18,26 +18,31 @@ func sanitizeText(s string) string { return sanitize.Clean(s) }
 
 // toolDef describes one MCP tool. Run performs the full orchestration.
 // Check, when set, runs extra authorization/validation with the caller's
-// grant before any workspace or container work happens.
+// grant before any workspace or container work happens. LocalRead, when set,
+// reports whether the tool only inspects the local workspace and therefore
+// never needs SSH credentials.
 type toolDef struct {
 	Name        string
 	Description string
 	Schema      map[string]any
 	Check       func(c *callCtx, a map[string]any, grant config.Grant) error
+	LocalRead   func(a map[string]any) bool
 	Run         func(ctx context.Context, c *callCtx, args map[string]any) (string, error)
 }
 
 // repoTool wraps a repository-scoped git tool: it extracts the repo argument
 // and delegates to the orchestration core with the required action. An
 // optional check runs with the caller's grant before any workspace work.
+// The returned *toolDef is shared with the Run closure, so later field
+// assignments (e.g. LocalRead) are visible to the closure.
 func repoTool(name, desc, action string, schema map[string]any,
 	build func(c *callCtx, a map[string]any, cloned bool) ([]string, error),
-	checks ...func(c *callCtx, a map[string]any, grant config.Grant) error) toolDef {
+	checks ...func(c *callCtx, a map[string]any, grant config.Grant) error) *toolDef {
 	var check func(c *callCtx, a map[string]any, grant config.Grant) error
 	if len(checks) > 0 {
 		check = checks[0]
 	}
-	d := toolDef{Name: name, Description: desc, Schema: schema, Check: check}
+	d := &toolDef{Name: name, Description: desc, Schema: schema, Check: check}
 	d.Run = func(ctx context.Context, c *callCtx, a map[string]any) (string, error) {
 		repoID, err := strArg(a, "repo")
 		if err != nil {
@@ -49,10 +54,19 @@ func repoTool(name, desc, action string, schema map[string]any,
 			}
 			return d.Check(c, a, grant)
 		}
-		return c.runGit(ctx, repoID, action, check, func(cloned bool) ([]string, error) {
+		localRead := d.LocalRead != nil && d.LocalRead(a)
+		return c.runGit(ctx, repoID, action, localRead, check, func(cloned bool) ([]string, error) {
 			return build(c, a, cloned)
 		})
 	}
+	return d
+}
+
+// localReadTool marks a tool that only inspects the local workspace (status,
+// diff, log, branch listing): it never needs SSH credentials, so the session
+// agent is not started for it.
+func localReadTool(d *toolDef) *toolDef {
+	d.LocalRead = func(map[string]any) bool { return true }
 	return d
 }
 
@@ -117,8 +131,9 @@ func repoProp() map[string]any {
 
 // runGit is the orchestration core: authorize → extra tool check → lock →
 // verify workspace → aggregate agent keys → ensure container → (clone if
-// needed) → exec.
-func (c *callCtx) runGit(ctx context.Context, repoID, action string,
+// needed) → exec. Pure local reads on a cloned workspace skip credential
+// resolution and the agent socket entirely.
+func (c *callCtx) runGit(ctx context.Context, repoID, action string, localRead bool,
 	check func(grant config.Grant) error, build func(cloned bool) ([]string, error)) (string, error) {
 	s := c.s
 	cfg := s.Store.Get()
@@ -172,35 +187,41 @@ func (c *callCtx) runGit(ctx context.Context, repoID, action string,
 		}
 	}
 
-	credNames := []string{grant.Credential}
-	if cloned {
-		extra, err := s.resolveSubmodules(c.user(), path)
-		if err != nil {
-			s.Audit.Log(audit.Event{Actor: c.user(), ActorType: "user", Event: "tool",
-				Repo: repoID, Result: "denied", Detail: err.Error()})
-			return "", err
+	// Pure local reads on a cloned workspace never need SSH credentials:
+	// skip credential resolution and the agent socket entirely.
+	var agentSocket string
+	if !cloned || !localRead {
+		credNames := []string{grant.Credential}
+		if cloned {
+			extra, err := s.resolveSubmodules(c.user(), path)
+			if err != nil {
+				s.Audit.Log(audit.Event{Actor: c.user(), ActorType: "user", Event: "tool",
+					Repo: repoID, Result: "denied", Detail: err.Error()})
+				return "", err
+			}
+			credNames = append(credNames, extra...)
 		}
-		credNames = append(credNames, extra...)
+
+		// Only decrypt credentials the session agent does not already hold;
+		// plaintext key material exists just long enough to parse the keys.
+		missing := s.Pool.MissingKeys(c.sid(), credNames)
+		if len(missing) > 0 {
+			keys, err := s.loadPrivateKeys(missing)
+			if err != nil {
+				return "", err
+			}
+			if _, err := s.Pool.StartSession(c.sid(), keys); err != nil {
+				return "", err
+			}
+		}
+		ag, ok := s.Pool.Get(c.sid())
+		if !ok {
+			return "", fmt.Errorf("session agent not available")
+		}
+		agentSocket = ag.Socket
 	}
 
-	// Only decrypt credentials the session agent does not already hold;
-	// plaintext key material exists just long enough to parse the keys.
-	missing := s.Pool.MissingKeys(c.sid(), credNames)
-	if len(missing) > 0 {
-		keys, err := s.loadPrivateKeys(missing)
-		if err != nil {
-			return "", err
-		}
-		if _, err := s.Pool.StartSession(c.sid(), keys); err != nil {
-			return "", err
-		}
-	}
-	ag, ok := s.Pool.Get(c.sid())
-	if !ok {
-		return "", fmt.Errorf("session agent not available")
-	}
-
-	containerID, err := s.Sess.EnsureContainer(ctx, c.sid(), repoID, c.user(), path, ag.Socket)
+	containerID, err := s.Sess.EnsureContainer(ctx, c.sid(), repoID, c.user(), path, agentSocket)
 	if err != nil {
 		return "", err
 	}
@@ -290,26 +311,26 @@ func (s *Server) toolDefs() []map[string]any {
 	return out
 }
 
-func (s *Server) toolByName(name string) (toolDef, bool) {
+func (s *Server) toolByName(name string) (*toolDef, bool) {
 	for _, d := range s.tools {
 		if d.Name == name {
 			return d, true
 		}
 	}
-	return toolDef{}, false
+	return nil, false
 }
 
 func (s *Server) initTools() {
-	s.tools = []toolDef{
-		repoTool("git_status",
+	s.tools = []*toolDef{
+		localReadTool(repoTool("git_status",
 			"Show working tree status (porcelain + branch info) of a registered repository.",
 			config.ActionRead,
 			objSchema(map[string]any{"repo": repoProp()}, "repo"),
 			func(c *callCtx, a map[string]any, cloned bool) ([]string, error) {
 				return []string{"git", "status", "--porcelain=v1", "-b"}, nil
-			}),
+			})),
 
-		repoTool("git_diff",
+		localReadTool(repoTool("git_diff",
 			"Show unstaged diff (staged=true for staged changes).",
 			config.ActionRead,
 			objSchema(map[string]any{"repo": repoProp(), "staged": boolProp("show staged changes instead")}, "repo"),
@@ -318,23 +339,23 @@ func (s *Server) initTools() {
 					return []string{"git", "diff", "--staged"}, nil
 				}
 				return []string{"git", "diff"}, nil
-			}),
+			})),
 
-		repoTool("git_log",
+		localReadTool(repoTool("git_log",
 			"Show recent commit history (oneline, newest first).",
 			config.ActionRead,
 			objSchema(map[string]any{"repo": repoProp(), "limit": intProp("max entries (default 20, cap 100)")}, "repo"),
 			func(c *callCtx, a map[string]any, cloned bool) ([]string, error) {
 				return []string{"git", "log", "--oneline", "-n", gittools.LogLimit(optInt(a, "limit"))}, nil
-			}),
+			})),
 
-		repoTool("git_branch_list",
+		localReadTool(repoTool("git_branch_list",
 			"List local and remote branches with tip commits.",
 			config.ActionRead,
 			objSchema(map[string]any{"repo": repoProp()}, "repo"),
 			func(c *callCtx, a map[string]any, cloned bool) ([]string, error) {
 				return []string{"git", "branch", "-a", "-v"}, nil
-			}),
+			})),
 
 		repoTool("git_create_branch",
 			"Create a new branch (optionally from a start point).",
@@ -536,5 +557,16 @@ func (s *Server) initTools() {
 			}
 			return nil
 		})
+	// run_git stays local-read only when the resolved command is a read-style
+	// subcommand; anything else keeps the credential-loading path.
+	rg.LocalRead = func(a map[string]any) bool {
+		raw, _ := a["args"].([]any)
+		args := make([]string, 0, len(raw))
+		for _, v := range raw {
+			sv, _ := v.(string)
+			args = append(args, sv)
+		}
+		return gittools.RequiredAction(args) == config.ActionRead
+	}
 	s.tools = append(s.tools, rg)
 }

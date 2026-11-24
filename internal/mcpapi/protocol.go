@@ -33,7 +33,7 @@ type Server struct {
 	Pool    *creds.AgentPool
 	Version string
 
-	tools []toolDef
+	tools []*toolDef
 
 	sMu      sync.Mutex
 	sessions map[string]*mcpSession
@@ -129,6 +129,18 @@ func (s *Server) sessionHasContainers(sessionID string) bool {
 		}
 	}
 	return false
+}
+
+// countUserSessions counts live MCP sessions owned by a user. The caller must
+// hold s.sMu.
+func (s *Server) countUserSessions(user string) int {
+	n := 0
+	for _, sess := range s.sessions {
+		if sess.User == user {
+			n++
+		}
+	}
+	return n
 }
 
 // teardownSessionRepo destroys the container, releases the lock and closes
@@ -257,6 +269,18 @@ func (s *Server) handleInitialize(w http.ResponseWriter, r *http.Request, actor 
 	case ok:
 		existing.LastSeen = time.Now()
 	default:
+		// bound the number of live sessions per user so a valid token cannot
+		// exhaust sockets and goroutines.
+		if limit := s.Store.Get().Server.MaxSessionsPerUser; limit > 0 &&
+			s.countUserSessions(actor) >= limit {
+			s.sMu.Unlock()
+			s.Audit.Log(audit.Event{Actor: actor, ActorType: "user", Event: "authz",
+				Session: sid, Result: "denied",
+				Detail: fmt.Sprintf("initialize rejected: active session limit %d reached", limit)})
+			writeJSON(w, http.StatusTooManyRequests,
+				map[string]string{"error": fmt.Sprintf("too many active sessions (limit %d)", limit)})
+			return
+		}
 		sid = uuid.NewString()
 		s.sessions[sid] = &mcpSession{ID: sid, User: actor, Created: time.Now(), LastSeen: time.Now()}
 	}
