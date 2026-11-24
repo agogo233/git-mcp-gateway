@@ -68,7 +68,7 @@ button.act.danger:hover{border-color:var(--bad);color:var(--bad)}
   <div id="tab-audit" class="panel"><h2>审计日志(最近 200 条)</h2><div class="row"><button class="act" onclick="loadAudit()">刷新</button></div><table id="audit"></table></div>
 
   <div id="tab-locks" class="panel"><h2>会话锁与工作区</h2>
-    <div class="row"><input id="lk_repo" placeholder="仓库 org/name"><button class="act danger" onclick="unlock()">强制解锁(并终止容器)</button><button class="act" onclick="fixWs()">修复工作区锁文件</button></div>
+    <div class="row"><input id="lk_repo" placeholder="仓库 org/name"><label><input type="checkbox" id="lk_clean"> 含未跟踪文件</label><button class="act danger" onclick="unlock()">强制解锁(并终止容器)</button><button class="act" onclick="fixWs()">修复工作区锁文件</button><button class="act danger" onclick="resetWs()">重置工作区</button></div>
     <table id="locks"></table></div>
 
   <button class="act" onclick="logout()">退出</button>
@@ -193,6 +193,11 @@ async function unlock(){
 async function fixWs(){
   const r = await api('/workspace/fix', {method:'POST', body: JSON.stringify({repo:$('#lk_repo').value.trim()})});
   msg('已清理: ' + JSON.stringify(r.removed||[]));
+}
+async function resetWs(){
+  if(!confirm('重置将丢弃该工作区所有未提交的改动，确认执行？')) return;
+  const r = await api('/workspace/reset', {method:'POST', body: JSON.stringify({repo:$('#lk_repo').value.trim(), clean:$('#lk_clean').checked})});
+  msg('已重置: ' + JSON.stringify(r.output||[]));
 }
 if(TOKEN) load();
 </script>

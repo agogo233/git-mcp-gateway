@@ -129,6 +129,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request, rest string) {
 		s.unlock(w, r)
 	case rest == "workspace/fix" && r.Method == http.MethodPost:
 		s.fixWorkspace(w, r)
+	case rest == "workspace/reset" && r.Method == http.MethodPost:
+		s.resetWorkspace(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
@@ -512,6 +514,30 @@ func (s *Server) fixWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 	s.auditOp("workspace fix for " + in.Repo + ": removed " + strings.Join(removed, ","))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed})
+}
+
+// resetWorkspace force-resets a workspace to the last committed state on
+// admin request; it is the only sanctioned big reset and is fully audited.
+func (s *Server) resetWorkspace(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Repo  string `json:"repo"`
+		Clean bool   `json:"clean"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	if in.Repo == "" {
+		writeJSON(w, 400, map[string]string{"error": "repo is required"})
+		return
+	}
+	out, err := s.Repos.ResetWorkspace(in.Repo, in.Clean)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	s.auditOp("workspace reset for " + in.Repo + " (clean=" + fmt.Sprint(in.Clean) + ")")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "output": out})
 }
 
 func (s *Server) audit(detail string) {

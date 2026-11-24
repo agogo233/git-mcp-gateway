@@ -9,9 +9,9 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}"
 
 # ---- runtime stage ----
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates \
- && addgroup -g 1000 gitmcp \
- && adduser -D -u 1000 -G gitmcp gitmcp
+RUN apk add --no-cache ca-certificates git \
+  && addgroup -g 1000 gitmcp \
+  && adduser -D -u 1000 -G gitmcp gitmcp
 COPY --from=build /out/git-mcp-gateway /usr/local/bin/git-mcp-gateway
 # The gateway talks to the Docker daemon through the socket mounted at
 # /var/run/docker.sock; in compose the host docker group gid is added via

@@ -4,9 +4,11 @@
 package repo
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -122,6 +124,48 @@ func (m *Manager) FixWorkspace(repoID string) ([]string, error) {
 		}
 	}
 	return removed, nil
+}
+
+// ResetWorkspace force-resets the persistent workspace to the last committed
+// state, discarding uncommitted changes; with clean it also removes untracked
+// files. It is the admin console's only sanctioned big reset: it refuses to
+// run while a session holds the repository lock and cleans stale git lock
+// files first so the reset cannot fail on a dead process's leftovers.
+func (m *Manager) ResetWorkspace(repoID string, clean bool) ([]string, error) {
+	_, path, err := m.Resolve(repoID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
+		return nil, ErrNotCloned
+	}
+	// Occupy the repository lock for the whole reset, so no session can
+	// start working in the workspace while it is being reset.
+	if err := m.TryLock(repoID, "admin-reset", "admin"); err != nil {
+		return nil, fmt.Errorf("%w: unlock the session before resetting the workspace", ErrLocked)
+	}
+	defer m.Release(repoID, "admin-reset")
+	if _, err := m.FixWorkspace(repoID); err != nil {
+		return nil, err
+	}
+	cmds := [][]string{
+		{"git", "-C", path, "reset", "--hard"},
+	}
+	if clean {
+		cmds = append(cmds, []string{"git", "-C", path, "clean", "-fd"})
+	}
+	var out []string
+	for _, c := range cmds {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		cmd := exec.CommandContext(ctx, c[0], c[1:]...)
+		data, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil {
+			return out, fmt.Errorf("git %s failed: %s", strings.Join(c[2:], " "), strings.TrimSpace(string(data)))
+		}
+		out = append(out, strings.TrimSpace(string(data)))
+	}
+	return out, nil
 }
 
 // TryLock acquires the repository mutex for a session. It fails immediately

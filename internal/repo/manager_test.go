@@ -1,8 +1,10 @@
 package repo
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -151,5 +153,72 @@ func TestPrecheckRejectsRemoteMismatch(t *testing.T) {
 	m := New(setup(t, ws))
 	if err := m.Precheck(repoID); !errors.Is(err, ErrRemoteMismatch) {
 		t.Fatalf("expected ErrRemoteMismatch, got %v", err)
+	}
+}
+
+func TestResetWorkspace(t *testing.T) {
+	repoID := "org/proj1"
+	ws := t.TempDir()
+	repoDir := filepath.Join(ws, "proj1")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		cmd := exec.CommandContext(context.Background(), args[0], args[1:]...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	run("git", "init")
+	run("git", "config", "user.name", "Tester")
+	run("git", "config", "user.email", "tester@test.com")
+	if err := os.WriteFile(filepath.Join(repoDir, "file.txt"), []byte("tracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("git", "add", "file.txt")
+	run("git", "commit", "-m", "init")
+
+	// dirty the workspace: modify a tracked file and add an untracked one
+	if err := os.WriteFile(filepath.Join(repoDir, "file.txt"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "junk.txt"), []byte("junk\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(setup(t, ws))
+
+	// reset --hard restores tracked files but keeps untracked files
+	if _, err := m.ResetWorkspace(repoID, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(repoDir, "file.txt")); string(got) != "tracked\n" {
+		t.Fatalf("tracked file not restored: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "junk.txt")); err != nil {
+		t.Fatal("untracked file must survive a reset without clean")
+	}
+
+	// reset with clean removes untracked files
+	if _, err := m.ResetWorkspace(repoID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, "junk.txt")); !os.IsNotExist(err) {
+		t.Fatal("clean should remove untracked files")
+	}
+
+	// refused while a session holds the lock
+	if err := m.TryLock(repoID, "s1", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ResetWorkspace(repoID, false); !errors.Is(err, ErrLocked) {
+		t.Fatalf("expected ErrLocked, got %v", err)
+	}
+	m.Release(repoID, "s1")
+
+	// refused when the workspace is not cloned
+	if _, err := New(setup(t, t.TempDir())).ResetWorkspace(repoID, false); !errors.Is(err, ErrNotCloned) {
+		t.Fatalf("expected ErrNotCloned, got %v", err)
 	}
 }
