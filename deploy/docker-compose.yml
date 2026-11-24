@@ -35,7 +35,7 @@ services:
         max-file: "3"
     volumes:
       - ../config:/etc/git-mcp-gateway:ro
-      - /var/lib/git-mcp/keys:/keys:ro
+      - /var/lib/git-mcp/keys:/keys
       - ${WORKSPACE_ROOT:-/srv/workspaces}:/srv/workspaces
       - /run/git-mcp:/run/git-mcp
       - /var/log/git-mcp:/var/log/git-mcp

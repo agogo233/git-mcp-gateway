@@ -7,3 +7,7 @@ server:
   socket_dir: /run/git-mcp/agents
   audit_file: /var/log/git-mcp/audit.jsonl
   github_host: github.com
+  max_sessions_per_user: 4               # 每用户活跃会话上限
+  session_memory_mb: 512                 # 会话容器内存限额（MB）
+  session_cpus: 1                        # 会话容器 CPU 限额
+  session_pids: 128                      # 会话容器进程数限额

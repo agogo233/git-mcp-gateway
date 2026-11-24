@@ -90,6 +90,7 @@ curl http://127.0.0.1:8443/healthz
 - 「凭据」页为每个仓库生成 deploy key —— 页面返回**公钥**（一次性显示），私钥已自动加密入库
 - 把公钥登记到对应 GitHub 仓库的 Settings → Deploy keys（需要 push 的勾选 Allow write access）
 - 「授权」页核对/保存授权表
+- 「锁」页可强制解锁、清理工作区残留锁文件、重置工作区（重置会丢弃未提交改动，需确认）
 
 也可以纯 CLI：
 
@@ -117,7 +118,7 @@ Agent 可用工具：`git_status / git_diff / git_log / git_branch_list / git_cr
 - [ ] alice 推送自己仓库 → 成功；bob 推送（只读凭据）→ 拒绝且有审计
 - [ ] bob（read/clone 授权）用 `run_git` 传 `["git","push","origin","main"]` → `permission denied: push not granted`
 - [ ] 用 bob 的 token 调 alice 的仓库 → `permission denied`；用 bob 的 token 复用 alice 的 `Mcp-Session-Id` → 403
-- [ ] `run_git` 传 `push --force` / `push --force-with-lease=main:abc` / `reset --hard` / `remote set-url` → 被拒
+- [ ] `run_git` 传 `push --force` / `push --force-with-lease=main:abc` / `reset --hard` / `remote set-url` / `tag -d` / `stash clear` / `checkout -- .` → 被拒
 - [ ] session 容器内 `find / -name "*.age" -o -name "id_*"` → 无私钥文件
 - [ ] 审计日志可见每次操作归因到 用户×仓库×凭据×完整命令
 - [ ] 同仓库并发第二个会话 → 被互斥锁拒绝
@@ -132,4 +133,6 @@ Agent 可用工具：`git_status / git_diff / git_log / git_branch_list / git_cr
 - gateway 容器持有 docker.sock（等同宿主机 root 权限），镜像最小化 + 只读配置缓解
 - deploy key 不过期：靠会话 TTL、授权粒度与审计兜底；后续可切 Vault SSH CA 短时证书或 GitHub App 短时 token
 - 内网明文传输：gateway 端口默认只绑宿主机 `127.0.0.1`，不对外网暴露；容器间走 opencode-net 直连，上 TLS 只需在反代层加
+- 配置校验更严：repo 的 `github` 字段须与 id 一致（大小写不敏感）、工作区目录全局唯一；存量配置违反时网关启动会 fail-fast，按报错修正即可
+- 认证限流：失败按令牌维度计数（20 次/10 分钟），并设每 IP 200 次/10 分钟兜底防洪泛——共享出口 IP 下可能临时全拒
 - Go GC 环境下内存加固非绝对（已做：即用即弃、置零、禁 swap、关 core dump；页锁为后续增强）
