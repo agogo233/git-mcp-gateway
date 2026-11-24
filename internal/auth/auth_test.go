@@ -4,6 +4,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -13,7 +14,7 @@ import (
 
 // testAuth builds an Authenticator backed by a real hot-reload store with one
 // enabled user (alice / goodTok) and an admin token.
-func testAuth(t *testing.T) *Authenticator {
+func testAuth(t *testing.T) (*Authenticator, *config.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	userHash, err := bcrypt.GenerateFromPassword([]byte("goodTok"), bcrypt.MinCost)
@@ -40,11 +41,11 @@ func testAuth(t *testing.T) *Authenticator {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(store)
+	return New(store), store
 }
 
 func TestAuthSuccess(t *testing.T) {
-	a := testAuth(t)
+	a, _ := testAuth(t)
 	r := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
 	r.Header.Set("Authorization", "Bearer goodTok")
 	user, _, err := a.User(r)
@@ -58,9 +59,48 @@ func TestAuthSuccess(t *testing.T) {
 	}
 }
 
-func TestAuthRateLimited(t *testing.T) {
-	a := testAuth(t)
-	// exhaust the per-IP failure budget from 192.0.2.1
+func TestAuthCacheHit(t *testing.T) {
+	a, _ := testAuth(t)
+	r := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
+	r.Header.Set("Authorization", "Bearer goodTok")
+	if _, _, err := a.User(r); err != nil {
+		t.Fatalf("first auth should succeed, got %v", err)
+	}
+	// the second call is served from the cache
+	if _, _, err := a.User(r); err != nil {
+		t.Fatalf("cached auth should succeed, got %v", err)
+	}
+}
+
+func TestAuthCacheInvalidatedOnTokenRotation(t *testing.T) {
+	a, store := testAuth(t)
+	r := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
+	r.Header.Set("Authorization", "Bearer goodTok")
+	if _, _, err := a.User(r); err != nil {
+		t.Fatalf("first auth should succeed, got %v", err)
+	}
+	newHash, err := bcrypt.GenerateFromPassword([]byte("rotated"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(c *config.Config) error {
+		u := c.Users["alice"]
+		u.TokenHash = string(newHash)
+		c.Users["alice"] = u
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// the rotation changes the configuration generation, so the stale cache
+	// entry must not keep the old token authenticating
+	if _, _, err := a.User(r); err == nil {
+		t.Fatal("rotated token must not authenticate via a stale cache entry")
+	}
+}
+
+func TestAuthRateLimitPerToken(t *testing.T) {
+	a, _ := testAuth(t)
+	// exhaust the failure budget for one presented token
 	for i := 0; i < authFailLimit; i++ {
 		r := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
 		r.RemoteAddr = "192.0.2.1:1234"
@@ -69,12 +109,39 @@ func TestAuthRateLimited(t *testing.T) {
 			t.Fatal("bad token must fail")
 		}
 	}
-	// now even the correct token is rejected for that IP
+	// that token is now rate limited
+	r := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
+	r.RemoteAddr = "192.0.2.1:1234"
+	r.Header.Set("Authorization", "Bearer wrong")
+	if _, _, err := a.User(r); err == nil {
+		t.Fatal("expected rate-limited rejection for the exhausted token")
+	}
+	// a different token from the same IP is unaffected
+	r2 := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
+	r2.RemoteAddr = "192.0.2.1:1234"
+	r2.Header.Set("Authorization", "Bearer goodTok")
+	if _, _, err := a.User(r2); err != nil {
+		t.Fatalf("valid token from the same IP must not be blocked, got %v", err)
+	}
+}
+
+func TestAuthRateLimitIPBackstop(t *testing.T) {
+	a, _ := testAuth(t)
+	// distinct bad tokens exhaust the per-IP backstop
+	for i := 0; i < authIPFailLimit; i++ {
+		r := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
+		r.RemoteAddr = "192.0.2.1:1234"
+		r.Header.Set("Authorization", "Bearer wrong-tok-"+strconv.Itoa(i))
+		if _, _, err := a.User(r); err == nil {
+			t.Fatal("bad token must fail")
+		}
+	}
+	// the IP backstop now rejects even a valid token from that IP
 	r := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
 	r.RemoteAddr = "192.0.2.1:1234"
 	r.Header.Set("Authorization", "Bearer goodTok")
 	if _, _, err := a.User(r); err == nil {
-		t.Fatal("expected rate-limited rejection for a valid token")
+		t.Fatal("expected per-IP backstop rejection after 200 failures")
 	}
 	// a different IP is unaffected
 	r2 := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
@@ -86,7 +153,7 @@ func TestAuthRateLimited(t *testing.T) {
 }
 
 func TestAuthRateLimitResetsOnSuccess(t *testing.T) {
-	a := testAuth(t)
+	a, _ := testAuth(t)
 	// a single failure, then a success from the same IP clears the counter
 	r := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
 	r.RemoteAddr = "192.0.2.5:1"

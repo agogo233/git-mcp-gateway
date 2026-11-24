@@ -1,9 +1,13 @@
 // Package auth validates Bearer tokens against bcrypt hashes from users.yaml.
-// Repeated failed attempts from the same client IP are rate limited so the
-// bcrypt cost cannot be abused as a CPU denial-of-service vector.
+// Repeated failed attempts are rate limited per presented token, with a
+// higher per-IP backstop, so the bcrypt cost cannot be abused as a CPU
+// denial-of-service vector — while a shared egress IP cannot be locked out by
+// one misbehaving caller. Successful authentications are cached briefly.
 package auth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/http"
@@ -18,12 +22,14 @@ import (
 // ErrUnauthorized is returned for missing/invalid credentials.
 var ErrUnauthorized = errors.New("unauthorized")
 
-// Failed-authentication rate limit: a fixed window per client IP. Once the
-// limit is hit, every attempt (including valid ones) is rejected until the
-// window expires; a successful authentication clears the counter.
+// Failed-authentication rate limits: failures are counted per presented token
+// (authFailLimit) and, as a backstop against token-rotation flooding, per
+// client IP (authIPFailLimit). A successful authentication clears both.
 const (
-	authFailLimit  = 20
-	authFailWindow = 10 * time.Minute
+	authFailLimit   = 20
+	authIPFailLimit = 200
+	authFailWindow  = 10 * time.Minute
+	authCacheTTL    = 5 * time.Minute
 )
 
 // Authenticator checks Bearer tokens for MCP users and the admin console.
@@ -32,6 +38,7 @@ type Authenticator struct {
 
 	mu    sync.Mutex
 	fails map[string]*failWindow
+	cache map[string]cacheEntry
 }
 
 type failWindow struct {
@@ -39,9 +46,36 @@ type failWindow struct {
 	reset time.Time
 }
 
+// cacheEntry remembers a verified token until the configuration generation
+// changes (e.g. a rotation) or the entry expires.
+type cacheEntry struct {
+	cfg  *config.Config
+	name string
+	user config.User
+	exp  time.Time
+}
+
 // New builds an Authenticator bound to the config store (hot reload aware).
 func New(store *config.Store) *Authenticator {
-	return &Authenticator{store: store, fails: map[string]*failWindow{}}
+	return &Authenticator{
+		store: store,
+		fails: map[string]*failWindow{},
+		cache: map[string]cacheEntry{},
+	}
+}
+
+// tokenKey maps a presented token to a stable hash for the failure window
+// and the cache; the plaintext token is never stored.
+func tokenKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return "t:" + hex.EncodeToString(sum[:])
+}
+
+func ipKey(ip string) string {
+	if ip == "" {
+		return ""
+	}
+	return "ip:" + ip
 }
 
 // User authenticates an MCP caller and returns its configured identity.
@@ -51,20 +85,26 @@ func (a *Authenticator) User(r *http.Request) (string, config.User, error) {
 		return "", config.User{}, ErrUnauthorized
 	}
 	ip := clientIP(r)
-	if a.limited(ip) {
+	cfg := a.store.Get()
+	tk := tokenKey(token)
+	if e, ok := a.cached(tk, cfg); ok {
+		a.resetKeys(tk, ipKey(ip))
+		return e.name, e.user, nil
+	}
+	if a.limited(tk, ipKey(ip)) {
 		return "", config.User{}, ErrUnauthorized
 	}
-	cfg := a.store.Get()
 	for name, u := range cfg.Users {
 		if u.Disabled {
 			continue
 		}
 		if bcrypt.CompareHashAndPassword([]byte(u.TokenHash), []byte(token)) == nil {
-			a.reset(ip)
+			a.storeCache(tk, cfg, name, u)
+			a.resetKeys(tk, ipKey(ip))
 			return name, u, nil
 		}
 	}
-	a.fail(ip)
+	a.failKeys(tk, ipKey(ip))
 	return "", config.User{}, ErrUnauthorized
 }
 
@@ -75,17 +115,23 @@ func (a *Authenticator) Admin(r *http.Request) error {
 		return ErrUnauthorized
 	}
 	ip := clientIP(r)
-	if a.limited(ip) {
+	cfg := a.store.Get()
+	tk := "a:" + tokenKey(token)
+	if _, ok := a.cached(tk, cfg); ok {
+		a.resetKeys(tk, ipKey(ip))
+		return nil
+	}
+	if a.limited(tk, ipKey(ip)) {
 		return ErrUnauthorized
 	}
-	hash := a.store.Get().AdminToken
 	// bcrypt hashes cannot be constant-time compared directly; comparing the
 	// derived key avoids trivially timing-parallel guessing.
-	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(token)) != nil {
-		a.fail(ip)
+	if bcrypt.CompareHashAndPassword([]byte(cfg.AdminToken), []byte(token)) != nil {
+		a.failKeys(tk, ipKey(ip))
 		return ErrUnauthorized
 	}
-	a.reset(ip)
+	a.storeCache(tk, cfg, "admin", config.User{})
+	a.resetKeys(tk, ipKey(ip))
 	return nil
 }
 
@@ -98,47 +144,82 @@ func HashToken(token string) (string, error) {
 	return string(h), nil
 }
 
-func (a *Authenticator) limited(ip string) bool {
-	if ip == "" {
-		return false
-	}
+func (a *Authenticator) cached(key string, cfg *config.Config) (cacheEntry, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	f, ok := a.fails[ip]
+	e, ok := a.cache[key]
 	if !ok {
-		return false
+		return cacheEntry{}, false
 	}
-	if time.Now().After(f.reset) {
-		delete(a.fails, ip)
-		return false
+	if e.cfg != cfg || time.Now().After(e.exp) {
+		delete(a.cache, key)
+		return cacheEntry{}, false
 	}
-	return f.count >= authFailLimit
+	return e, true
 }
 
-func (a *Authenticator) fail(ip string) {
-	if ip == "" {
-		return
-	}
+func (a *Authenticator) storeCache(key string, cfg *config.Config, name string, u config.User) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	f, ok := a.fails[ip]
-	if !ok || time.Now().After(f.reset) {
-		if len(a.fails) > 4096 { // hard bound on tracker memory
-			a.fails = map[string]*failWindow{}
-		}
-		a.fails[ip] = &failWindow{count: 1, reset: time.Now().Add(authFailWindow)}
-		return
+	if len(a.cache) > 4096 {
+		a.cache = map[string]cacheEntry{}
 	}
-	f.count++
+	a.cache[key] = cacheEntry{cfg: cfg, name: name, user: u, exp: time.Now().Add(authCacheTTL)}
 }
 
-func (a *Authenticator) reset(ip string) {
-	if ip == "" {
-		return
-	}
+func (a *Authenticator) limited(keys ...string) bool {
 	a.mu.Lock()
-	delete(a.fails, ip)
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		f, ok := a.fails[k]
+		if !ok {
+			continue
+		}
+		if time.Now().After(f.reset) {
+			delete(a.fails, k)
+			continue
+		}
+		limit := authFailLimit
+		if strings.HasPrefix(k, "ip:") {
+			limit = authIPFailLimit
+		}
+		if f.count >= limit {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Authenticator) failKeys(keys ...string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		f, ok := a.fails[k]
+		if !ok || time.Now().After(f.reset) {
+			if len(a.fails) > 4096 { // hard bound on tracker memory
+				a.fails = map[string]*failWindow{}
+			}
+			a.fails[k] = &failWindow{count: 1, reset: time.Now().Add(authFailWindow)}
+			continue
+		}
+		f.count++
+	}
+}
+
+func (a *Authenticator) resetKeys(keys ...string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, k := range keys {
+		if k != "" {
+			delete(a.fails, k)
+		}
+	}
 }
 
 func clientIP(r *http.Request) string {
