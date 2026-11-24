@@ -17,6 +17,10 @@ func TestCheckRunArgs(t *testing.T) {
 		{"git", "remote", "get-url", "origin"},
 		{"git", "fetch", "--prune"},
 		{"git", "fetch", "origin"},
+		{"git", "stash", "list"},
+		{"git", "stash", "push", "-m", "wip"},
+		{"git", "checkout", "main"},
+		{"git", "restore", "--staged", "src/x"},
 	}
 	for _, a := range allowed {
 		if err := CheckRunArgs(a); err != nil {
@@ -39,6 +43,14 @@ func TestCheckRunArgs(t *testing.T) {
 		{"git", "clean", "-fd"},
 		{"git", "config", "user.name", "evil"},
 		{"git", "submodule", "update", "--init"},
+		{"git", "tag", "-d", "v1"},
+		{"git", "branch", "-d", "x"},
+		{"git", "stash", "clear"},
+		{"git", "stash", "drop"},
+		{"git", "checkout", "--", "."},
+		{"git", "checkout", "."},
+		{"git", "restore", "."},
+		{"git", "switch", "--discard-changes", "main"},
 		{"ls", "-la"},
 		{"git"},
 	}

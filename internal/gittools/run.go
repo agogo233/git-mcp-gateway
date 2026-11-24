@@ -25,9 +25,10 @@ var allowlist = map[string]bool{
 // run_git invocations regardless of subcommand.
 var forbiddenArgs = map[string]bool{
 	"--force": true, "-f": true, "--hard": true, "--amend": true,
-	"-D": true, "--delete": true, "--prune-empty": true,
+	"-D": true, "-d": true, "--delete": true, "--prune-empty": true,
 	"--exec": true, "--upload-pack": true, "--receive-pack": true,
 	"-c": true, "--config": true,
+	"--discard-changes": true,
 }
 
 // remoteWriteSubcommands mutate the workspace's remote configuration and are
@@ -58,6 +59,7 @@ func CheckRunArgs(args []string) error {
 	if !allowlist[sub] {
 		return fmt.Errorf("git subcommand %q is not allowed", sub)
 	}
+	sawStashSub := false
 	for _, a := range args[2:] {
 		if forbiddenArgs[a] {
 			return fmt.Errorf("argument %q is not allowed", a)
@@ -84,6 +86,24 @@ func CheckRunArgs(args []string) error {
 			// the remote subcommand.
 			if !strings.HasPrefix(a, "-") && remoteWriteSubcommands[a] {
 				return fmt.Errorf("git remote %s is not allowed", a)
+			}
+		case "stash":
+			// stash clear/drop destroy saved work unconditionally: never
+			// allowed through the escape hatch.
+			if !strings.HasPrefix(a, "-") && !sawStashSub {
+				sawStashSub = true
+				if a == "clear" || a == "drop" {
+					return fmt.Errorf("git stash %s is not allowed", a)
+				}
+			}
+		case "checkout", "restore", "switch":
+			// Ref switches are always allowed. Whole-tree pathspec forms
+			// ("--", ".", "./...", or ":<magic>") discard uncommitted
+			// changes and are banned; individual file paths stay allowed so
+			// agents can restore single files (e.g. "git restore --staged
+			// src/x", which only unstages).
+			if a == "--" || a == "." || strings.HasPrefix(a, "./") || strings.HasPrefix(a, ":") {
+				return fmt.Errorf("pathspec %q is not allowed (ref switches only)", a)
 			}
 		}
 	}
