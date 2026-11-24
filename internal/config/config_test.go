@@ -98,6 +98,67 @@ grants:
 	}
 }
 
+func TestLoadRejectsGithubMismatch(t *testing.T) {
+	dir, clean := baseConfig(validUsers, validGrants, `workspace_root: /srv/workspaces
+repos:
+  org/proj1:
+    github: other/name
+`)
+	defer clean()
+	if _, err := Load(dir); err == nil {
+		t.Fatal("expected validation error when github does not match the repo id")
+	}
+}
+
+func TestLoadRejectsDuplicateWorkspaceDir(t *testing.T) {
+	for _, repos := range []string{
+		// default-derived conflict: both repos derive the dir "proj1"
+		`workspace_root: /srv/workspaces
+repos:
+  org/proj1:
+    github: org/proj1
+  other/proj1:
+    github: other/proj1
+`,
+		// explicit conflict: two repos declare the same dir
+		`workspace_root: /srv/workspaces
+repos:
+  org/proj1:
+    github: org/proj1
+  org/proj2:
+    github: org/proj2
+    dir: proj1
+`,
+	} {
+		dir, clean := baseConfig(validUsers, validGrants, repos)
+		if _, err := Load(dir); err == nil {
+			t.Fatalf("expected validation error for duplicate workspace dir:\n%s", repos)
+		}
+		clean()
+	}
+}
+
+func TestServerDefaults(t *testing.T) {
+	dir, clean := baseConfig(validUsers, validGrants, validRepos)
+	defer clean()
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.MaxSessionsPerUser != 4 {
+		t.Fatalf("MaxSessionsPerUser default = %d, want 4", cfg.Server.MaxSessionsPerUser)
+	}
+	if cfg.Server.SessionMemoryMB != 512 {
+		t.Fatalf("SessionMemoryMB default = %d, want 512", cfg.Server.SessionMemoryMB)
+	}
+	if cfg.Server.SessionCPUs != 1 {
+		t.Fatalf("SessionCPUs default = %v, want 1", cfg.Server.SessionCPUs)
+	}
+	if cfg.Server.SessionPids != 128 {
+		t.Fatalf("SessionPids default = %d, want 128", cfg.Server.SessionPids)
+	}
+}
+
 func TestLoadRejectsBadRepoDir(t *testing.T) {
 	dir, clean := baseConfig(validUsers, validGrants, `workspace_root: /srv/workspaces
 repos:

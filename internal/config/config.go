@@ -42,15 +42,19 @@ const (
 
 // Server holds runtime knobs.
 type Server struct {
-	Addr           string        `yaml:"addr"`          // listen address, e.g. ":8443"
-	SessionImage   string        `yaml:"session_image"` // session container image
-	SessionTTL     time.Duration `yaml:"session_ttl"`   // idle time before a session container is reaped
-	ExecTimeout    time.Duration `yaml:"exec_timeout"`  // per git-command timeout
-	MaxOutputBytes int           `yaml:"max_output_bytes"`
-	SocketDir      string        `yaml:"socket_dir"`  // where session agent sockets live
-	AuditFile      string        `yaml:"audit_file"`  // JSONL audit sink
-	GitHubHost     string        `yaml:"github_host"` // normally github.com
-	LogLevel       string        `yaml:"log_level"`
+	Addr               string        `yaml:"addr"`          // listen address, e.g. ":8443"
+	SessionImage       string        `yaml:"session_image"` // session container image
+	SessionTTL         time.Duration `yaml:"session_ttl"`   // idle time before a session container is reaped
+	ExecTimeout        time.Duration `yaml:"exec_timeout"`  // per git-command timeout
+	MaxOutputBytes     int           `yaml:"max_output_bytes"`
+	SocketDir          string        `yaml:"socket_dir"`  // where session agent sockets live
+	AuditFile          string        `yaml:"audit_file"`  // JSONL audit sink
+	GitHubHost         string        `yaml:"github_host"` // normally github.com
+	LogLevel           string        `yaml:"log_level"`
+	MaxSessionsPerUser int           `yaml:"max_sessions_per_user"` // active MCP sessions per user
+	SessionMemoryMB    int           `yaml:"session_memory_mb"`     // session container memory limit (MB)
+	SessionCPUs        float64       `yaml:"session_cpus"`          // session container CPU limit
+	SessionPids        int64         `yaml:"session_pids"`          // session container pids limit
 }
 
 // User is a human/automation account that calls the gateway with a Bearer token.
@@ -141,6 +145,7 @@ type Store struct {
 	dir string
 
 	mu       sync.RWMutex
+	writeMu  sync.Mutex // serialises Update so concurrent mutations cannot interleave on disk
 	cur      *Config
 	onChange func(*Config)
 
@@ -205,8 +210,12 @@ func (s *Store) watch() {
 // Update applies a mutation to the in-memory configuration, persists the
 // changed files and re-validates from disk. The mutation runs on a deep copy
 // of the current configuration, so concurrent readers never see a half-mutated
-// snapshot and a failed change simply drops the copy.
+// snapshot and a failed change simply drops the copy. Concurrent Updates are
+// serialised by a write lock so their disk writes cannot interleave.
 func (s *Store) Update(mutate func(*Config) error) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	s.mu.RLock()
 	cur := deepCopyConfig(s.cur)
 	s.mu.RUnlock()
@@ -214,17 +223,64 @@ func (s *Store) Update(mutate func(*Config) error) error {
 	if err := mutate(cur); err != nil {
 		return err
 	}
-	if err := SaveUsers(s.dir, cur.Users, cur.AdminToken); err != nil {
-		return err
-	}
-	if err := SaveGrants(s.dir, cur.Credentials, cur.Grants); err != nil {
-		return err
-	}
-	if err := SaveRepos(s.dir, cur.WorkspaceRoot, cur.Repos); err != nil {
+	if err := saveAll(s.dir, cur); err != nil {
 		return err
 	}
 	if err := s.reload(); err != nil {
 		return fmt.Errorf("change rejected by validation: %w", err)
+	}
+	return nil
+}
+
+// saveAll persists all configuration files as one unit: every file is written
+// to a temporary name first and only then renamed, so a failure part-way
+// through cannot leave a half-updated configuration on disk. If a rename
+// fails, the previous file contents are restored.
+func saveAll(dir string, c *Config) error {
+	files := []struct {
+		name string
+		v    any
+	}{
+		{"users.yaml", map[string]any{"users": c.Users, "admin_token_hash": c.AdminToken}},
+		{"grants.yaml", map[string]any{"credentials": c.Credentials, "grants": c.Grants}},
+		{"repos.yaml", map[string]any{"workspace_root": c.WorkspaceRoot, "repos": c.Repos}},
+	}
+	old := map[string][]byte{}
+	for _, f := range files {
+		if b, err := os.ReadFile(filepath.Join(dir, f.name)); err == nil {
+			old[f.name] = b
+		}
+	}
+	tmps := make([]string, 0, len(files))
+	for _, f := range files {
+		data, err := yaml.Marshal(f.v)
+		if err != nil {
+			for _, t := range tmps {
+				_ = os.Remove(t)
+			}
+			return err
+		}
+		tmp := filepath.Join(dir, f.name+".tmp")
+		if err := os.WriteFile(tmp, data, 0o600); err != nil {
+			for _, t := range tmps {
+				_ = os.Remove(t)
+			}
+			return err
+		}
+		tmps = append(tmps, tmp)
+	}
+	for i, f := range files {
+		if err := os.Rename(tmps[i], filepath.Join(dir, f.name)); err != nil {
+			for j := 0; j < i; j++ {
+				if b, ok := old[files[j].name]; ok {
+					_ = os.WriteFile(filepath.Join(dir, files[j].name), b, 0o600)
+				}
+			}
+			for _, t := range tmps {
+				_ = os.Remove(t)
+			}
+			return err
+		}
 	}
 	return nil
 }
@@ -311,30 +367,6 @@ func Load(dir string) (*Config, error) {
 	return cfg, nil
 }
 
-// SaveUsers writes users.yaml (used by the admin console).
-func SaveUsers(dir string, users map[string]User, adminToken string) error {
-	return writeYAML(filepath.Join(dir, "users.yaml"), map[string]any{
-		"users":            users,
-		"admin_token_hash": adminToken,
-	})
-}
-
-// SaveGrants writes grants.yaml (used by the admin console).
-func SaveGrants(dir string, creds map[string]Credential, grants []Grant) error {
-	return writeYAML(filepath.Join(dir, "grants.yaml"), map[string]any{
-		"credentials": creds,
-		"grants":      grants,
-	})
-}
-
-// SaveRepos writes repos.yaml (used by the admin console).
-func SaveRepos(dir string, root string, repos map[string]Repo) error {
-	return writeYAML(filepath.Join(dir, "repos.yaml"), map[string]any{
-		"workspace_root": root,
-		"repos":          repos,
-	})
-}
-
 func defaults(s *Server) {
 	if s.Addr == "" {
 		s.Addr = ":8443"
@@ -360,6 +392,18 @@ func defaults(s *Server) {
 	if s.GitHubHost == "" {
 		s.GitHubHost = "github.com"
 	}
+	if s.MaxSessionsPerUser == 0 {
+		s.MaxSessionsPerUser = 4
+	}
+	if s.SessionMemoryMB == 0 {
+		s.SessionMemoryMB = 512
+	}
+	if s.SessionCPUs == 0 {
+		s.SessionCPUs = 1
+	}
+	if s.SessionPids == 0 {
+		s.SessionPids = 128
+	}
 }
 
 // Validate enforces the invariants documented in the design.
@@ -384,6 +428,7 @@ func (c *Config) Validate() error {
 	if len(c.Repos) == 0 {
 		return fmt.Errorf("at least one repo must be defined")
 	}
+	effDirs := map[string]string{}
 	for id, r := range c.Repos {
 		if !repoIDPattern.MatchString(id) {
 			return fmt.Errorf("repo id %q must be org/name using only [A-Za-z0-9._-]", id)
@@ -391,9 +436,20 @@ func (c *Config) Validate() error {
 		if !strings.Contains(r.GitHub, "/") {
 			return fmt.Errorf("repo %q: github must be org/name", id)
 		}
-		if r.Dir != "" && !namePattern.MatchString(r.Dir) {
+		if !strings.EqualFold(r.GitHub, id) {
+			return fmt.Errorf("repo %q: github must match the repo id (the clone URL is derived from the id)", id)
+		}
+		dir := r.Dir
+		if dir == "" {
+			_, dir, _ = strings.Cut(id, "/")
+		}
+		if !namePattern.MatchString(dir) {
 			return fmt.Errorf("repo %q: dir must be a single safe path element", id)
 		}
+		if prev, dup := effDirs[dir]; dup {
+			return fmt.Errorf("repo %q: workspace dir %q is already used by repo %q", id, dir, prev)
+		}
+		effDirs[dir] = id
 	}
 	for name, cred := range c.Credentials {
 		if !namePattern.MatchString(name) {
@@ -450,16 +506,4 @@ func readYAML(path string, out any) error {
 		return fmt.Errorf("parse %s: %w", path, err)
 	}
 	return nil
-}
-
-func writeYAML(path string, v any) error {
-	data, err := yaml.Marshal(v)
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
 }
