@@ -81,15 +81,24 @@ func (m *Manager) EnsureContainer(ctx context.Context, sessionID, repoID, user, 
 
 func (m *Manager) create(ctx context.Context, sessionID, repoID, user, hostRepoPath, agentSocket string, cfg *config.Config) (string, error) {
 	u := cfg.Users[user]
+	// local-read sessions carry no agent socket: skip SSH_AUTH_SOCK so the
+	// environment does not point at a path that was never mounted.
+	env := []string{
+		"GIT_AUTHOR_NAME=" + u.Name,
+		"GIT_AUTHOR_EMAIL=" + u.Email,
+		"GIT_COMMITTER_NAME=" + u.Name,
+		"GIT_COMMITTER_EMAIL=" + u.Email,
+	}
+	if agentSocket != "" {
+		env = append(env, "SSH_AUTH_SOCK="+"/ssh-agent/agent.sock")
+	}
+	cpus := cfg.Server.SessionCPUs
+	if cpus <= 0 {
+		cpus = 1
+	}
 	cc := &container.Config{
-		Image: cfg.Server.SessionImage,
-		Env: []string{
-			"SSH_AUTH_SOCK=" + "/ssh-agent/agent.sock",
-			"GIT_AUTHOR_NAME=" + u.Name,
-			"GIT_AUTHOR_EMAIL=" + u.Email,
-			"GIT_COMMITTER_NAME=" + u.Name,
-			"GIT_COMMITTER_EMAIL=" + u.Email,
-		},
+		Image:      cfg.Server.SessionImage,
+		Env:        env,
 		WorkingDir: "/workspace",
 		User:       "1000:1000",
 		Labels: map[string]string{
@@ -102,15 +111,19 @@ func (m *Manager) create(ctx context.Context, sessionID, repoID, user, hostRepoP
 	hc := &container.HostConfig{
 		Binds: []string{
 			hostRepoPath + ":/workspace:rw",
-			agentSocket + ":" + "/ssh-agent/agent.sock:rw",
 		},
 		CapDrop:     []string{"ALL"},
 		SecurityOpt: []string{"no-new-privileges"},
 		Resources: container.Resources{
-			Memory:    512 * 1024 * 1024,
-			NanoCPUs:  1e9,
-			PidsLimit: int64Ptr(128),
+			Memory:    sessionMemoryBytes(cfg.Server.SessionMemoryMB),
+			NanoCPUs:  int64(cpus * 1e9),
+			PidsLimit: sessionPidsLimit(cfg.Server.SessionPids),
 		},
+	}
+	// Local-read sessions carry no SSH agent: only attach the socket when the
+	// session actually needs credentials.
+	if agentSocket != "" {
+		hc.Binds = append(hc.Binds, agentSocket+":/ssh-agent/agent.sock:rw")
 	}
 	created, err := m.cli.ContainerCreate(ctx, cc, hc, nil, nil, "")
 	if err != nil {
@@ -245,7 +258,23 @@ func IsNotFound(err error) bool {
 		strings.Contains(err.Error(), "no such exec")
 }
 
-func int64Ptr(v int64) *int64 { return &v }
+// sessionMemoryBytes maps the configured per-session memory limit (MB) to
+// bytes, falling back to the historical default.
+func sessionMemoryBytes(mb int) int64 {
+	if mb <= 0 {
+		return 512 * 1024 * 1024
+	}
+	return int64(mb) * 1024 * 1024
+}
+
+// sessionPidsLimit maps the configured pids limit, falling back to the
+// historical default.
+func sessionPidsLimit(v int64) *int64 {
+	if v <= 0 {
+		v = 128
+	}
+	return &v
+}
 
 // Close closes the docker client.
 func (m *Manager) Close() error { return m.cli.Close() }
